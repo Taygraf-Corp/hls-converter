@@ -1,0 +1,50 @@
+{
+  "name": "taygram-video-migration",
+  "version": "1.0.0",
+  "description": "Migration utility to convert MP4 files to HLS/CMAF format in Supabase storage",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "server": "tsx src/server.ts",
+    "server:prod": "node dist/server.js",
+    "migrate": "tsx src/migrate.ts",
+    "sync-hls-urls": "tsx scripts/sync-hls-urls.ts",
+    "test": "jest"
+  },
+  "keywords": [
+    "video",
+    "migration",
+    "hls",
+    "cmaf",
+    "supabase",
+    "ffmpeg"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.21.2",
+    "fluent-ffmpeg": "^2.1.2",
+    "mime-types": "^2.1.35",
+    "multer": "^1.4.5-lts.1",
+    "p-limit": "^5.0.0",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/fluent-ffmpeg": "^2.1.24",
+    "@types/jest": "^29.5.8",
+    "@types/mime-types": "^2.1.4",
+    "@types/multer": "^1.4.11",
+    "@types/node": "^20.10.0",
+    "jest": "^29.7.0",
+    "tsx": "^4.6.0",
+    "typescript": "^5.3.0"
+  }
+}

@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Upload Test</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 600px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+            text-align: center;
+        }
+
+        .upload-area {
+            border: 2px dashed #667eea;
+            border-radius: 10px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-bottom: 20px;
+        }
+
+        .upload-area:hover {
+            border-color: #764ba2;
+            background: #f8f9ff;
+        }
+
+        .upload-area.drag-over {
+            border-color: #764ba2;
+            background: #f0f2ff;
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            font-size: 14px;
+            transition: border-color 0.3s ease;
+        }
+
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        button {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s ease;
+        }
+
+        button:hover:not(:disabled) {
+            transform: translateY(-2px);
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .status {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 8px;
+            display: none;
+        }
+
+        .status.show {
+            display: block;
+        }
+
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .status.processing {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+
+        .result {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            font-size: 12px;
+            display: none;
+        }
+
+        .result.show {
+            display: block;
+        }
+
+        .result pre {
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        .progress {
+            margin-top: 20px;
+            display: none;
+        }
+
+        .progress.show {
+            display: block;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            width: 0;
+            transition: width 0.3s ease;
+        }
+
+        .file-info {
+            margin-top: 10px;
+            font-size: 14px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎬 Video Upload & Processing</h1>
+        
+        <form id="uploadForm">
+            <div class="upload-area" id="uploadArea">
+                <input type="file" id="videoFile" accept="video/*" required>
+                <p>📁 Click to select video or drag & drop</p>
+                <p style="font-size: 12px; color: #999; margin-top: 10px;">Max size: 500MB</p>
+            </div>
+
+            <div class="file-info" id="fileInfo"></div>
+
+            <input type="text" id="userId" placeholder="User ID (optional)" value="test-user">
+            <input type="text" id="videoId" placeholder="Video ID (optional)" value="">
+            <input type="text" id="postId" placeholder="Post ID (optional)" value="">
+            
+            <button type="submit" id="submitBtn">Upload & Process</button>
+        </form>
+
+        <div class="progress" id="progress">
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+        </div>
+
+        <div class="status" id="status"></div>
+        <div class="result" id="result"></div>
+    </div>
+
+    <script>
+        const API_URL = 'http://localhost:3000';
+        
+        const uploadArea = document.getElementById('uploadArea');
+        const videoFile = document.getElementById('videoFile');
+        const fileInfo = document.getElementById('fileInfo');
+        const uploadForm = document.getElementById('uploadForm');
+        const submitBtn = document.getElementById('submitBtn');
+        const status = document.getElementById('status');
+        const result = document.getElementById('result');
+        const progress = document.getElementById('progress');
+        const progressFill = document.getElementById('progressFill');
+
+        // Click to upload
+        uploadArea.addEventListener('click', () => {
+            videoFile.click();
+        });
+
+        // File selection
+        videoFile.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                showFileInfo(file);
+            }
+        });
+
+        // Drag and drop
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('drag-over');
+        });
+
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('drag-over');
+        });
+
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('drag-over');
+            
+            const file = e.dataTransfer.files[0];
+            if (file && file.type.startsWith('video/')) {
+                videoFile.files = e.dataTransfer.files;
+                showFileInfo(file);
+            } else {
+                showStatus('Please drop a video file', 'error');
+            }
+        });
+
+        function showFileInfo(file) {
+            const sizeMB = (file.size / 1024 / 1024).toFixed(2);
+            fileInfo.textContent = `📹 ${file.name} (${sizeMB} MB)`;
+        }
+
+        function showStatus(message, type) {
+            status.textContent = message;
+            status.className = `status show ${type}`;
+        }
+
+        function showResult(data) {
+            result.innerHTML = `<pre>${JSON.stringify(data, null, 2)}</pre>`;
+            result.classList.add('show');
+        }
+
+        function showProgress(show) {
+            if (show) {
+                progress.classList.add('show');
+                progressFill.style.width = '0%';
+            } else {
+                progress.classList.remove('show');
+            }
+        }
+
+        function updateProgress(percent) {
+            progressFill.style.width = `${percent}%`;
+        }
+
+        // Form submission
+        uploadForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const file = videoFile.files[0];
+            if (!file) {
+                showStatus('Please select a video file', 'error');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('video', file);
+            formData.append('userId', document.getElementById('userId').value);
+            formData.append('videoId', document.getElementById('videoId').value);
+            formData.append('postId', document.getElementById('postId').value);
+
+            submitBtn.disabled = true;
+            showStatus('Uploading and processing video...', 'processing');
+            showProgress(true);
+            result.classList.remove('show');
+
+            // Simulate progress (since we can't track actual progress easily)
+            let progressValue = 0;
+            const progressInterval = setInterval(() => {
+                if (progressValue < 90) {
+                    progressValue += Math.random() * 10;
+                    updateProgress(Math.min(progressValue, 90));
+                }
+            }, 500);
+
+            try {
+                const response = await fetch(`${API_URL}/api/upload`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                clearInterval(progressInterval);
+                updateProgress(100);
+
+                const data = await response.json();
+
+                if (data.success) {
+                    const processingTime = (data.data.processingTime / 1000).toFixed(2);
+                    showStatus(`✅ Success! Processed in ${processingTime}s`, 'success');
+                    showResult(data);
+                } else {
+                    showStatus(`❌ Error: ${data.error}`, 'error');
+                    showResult(data);
+                }
+
+            } catch (error) {
+                clearInterval(progressInterval);
+                showStatus(`❌ Upload failed: ${error.message}`, 'error');
+                console.error('Upload error:', error);
+            } finally {
+                submitBtn.disabled = false;
+                setTimeout(() => showProgress(false), 1000);
+            }
+        });
+
+        // Test connection on load
+        fetch(`${API_URL}/health`)
+            .then(res => res.json())
+            .then(() => {
+                console.log('✅ Connected to server');
+            })
+            .catch(() => {
+                showStatus('⚠️ Cannot connect to server. Make sure it\'s running on port 3000', 'error');
+            });
+    </script>
+</body>
+</html>
+
