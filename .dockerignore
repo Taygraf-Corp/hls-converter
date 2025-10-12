@@ -1,0 +1,16 @@
+node_modules
+dist
+temp
+*.log
+.env
+.git
+.gitignore
+README.md
+GETTING_STARTED.md
+SERVER_GUIDE.md
+examples
+scripts
+.vscode
+.idea
+*.md
+

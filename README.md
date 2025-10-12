@@ -1,4 +1,4 @@
-# Taygram Video Migration & Processing
+# Video Migration & Processing
 
 A complete solution for converting MP4 videos to HLS format with adaptive streaming. Includes both batch migration tools and an Express API server for real-time video processing.
 
@@ -92,25 +92,6 @@ npm run migrate -- --dry-run              # Preview what will be processed
 npm run migrate -- --retry-failed         # Retry failed videos
 ```
 
-### 3. Sync HLS URLs to Posts
-
-After processing videos, update your posts table with HLS URLs:
-
-```bash
-# Preview what will be updated
-npm run sync-hls-urls -- --dry-run
-
-# Apply updates
-npm run sync-hls-urls
-```
-
-The script automatically:
-- Finds all HLS files in storage
-- Matches them to posts by video filename
-- Updates posts with the full HLS URL
-
-See [scripts/README.md](./scripts/README.md) for more details.
-
 ## Project Structure
 
 ```
@@ -165,10 +146,6 @@ if (result.success) {
   console.log('Processing time:', result.data.processingTime);
 }
 ```
-
-### Test Upload Page
-
-Open `examples/upload-test.html` in your browser for a visual upload interface.
 
 ## Resolution Ladders
 
@@ -259,39 +236,9 @@ npm run server:prod
 # Run migration
 npm run migrate
 
-# Run tests
-npm test
-```
-
-## Docker Deployment
-
-```dockerfile
-FROM node:18-alpine
-
-# Install FFmpeg
-RUN apk add --no-cache ffmpeg
-
-WORKDIR /app
-
-COPY package*.json ./
-RUN npm ci --only=production
-
-COPY . .
-RUN npm run build
-
-EXPOSE 3000
-
-CMD ["npm", "run", "server:prod"]
-```
-
-```bash
-docker build -t video-processor .
-docker run -p 3000:3000 --env-file .env video-processor
-```
-
 ## Requirements
 
-- Node.js 18+
+- Node.js 20+
 - FFmpeg installed on system
 - Supabase project with storage enabled
 
@@ -307,20 +254,6 @@ brew install ffmpeg
 # Alpine Linux (Docker)
 apk add ffmpeg
 ```
-
-## Performance
-
-- **Small videos (<100MB)**: ~30-60 seconds
-- **Medium videos (100-500MB)**: ~2-4 minutes
-- **Large videos (>500MB)**: ~5-8 minutes
-
-Processing time depends on:
-- Video length and resolution
-- Number of quality levels generated
-- CPU performance
-- Disk I/O speed
-
-## Configuration
 
 ### Environment Variables
 
@@ -347,16 +280,6 @@ HLS_SEGMENT_DURATION=6            # Segment duration (seconds)
 HLS_PLAYLIST_TYPE=vod             # 'vod' or 'event'
 ```
 
-## Troubleshooting
-
-### FFmpeg not found
-```bash
-# Check FFmpeg installation
-ffmpeg -version
-
-# Install if missing (see Requirements section)
-```
-
 ### Out of memory
 ```bash
 # Increase Node.js memory
@@ -368,13 +291,6 @@ NODE_OPTIONS="--max-old-space-size=4096" npm run server
 - Use SSD for TEMP_DIR
 - Check CPU usage
 - Consider dedicated processing server
-
-## Documentation
-
-- [SERVER_GUIDE.md](./SERVER_GUIDE.md) - Complete API documentation
-- [examples/](./examples/) - Code examples
-
-## Architecture
 
 ### Services
 
@@ -391,30 +307,6 @@ NODE_OPTIONS="--max-old-space-size=4096" npm run server
 5. **Upload** - Upload segments to Supabase Storage
 6. **Cleanup** - Remove temporary files
 
-## Testing
-
-### Manual Testing
-
-1. Start server: `npm run server`
-2. Open `examples/upload-test.html`
-3. Upload a video
-4. Check response and generated files
-
-### API Testing
-
-```bash
-# Health check
-curl http://localhost:3000/health
-
-# Upload video
-curl -X POST http://localhost:3000/api/upload \
-  -F "video=@test-video.mp4" \
-  -F "userId=test-user"
-
-# Validate video
-curl -X POST http://localhost:3000/api/validate \
-  -F "video=@test-video.mp4"
-```
 
 ## Production Considerations
 
@@ -435,15 +327,3 @@ curl -X POST http://localhost:3000/api/validate \
 - Track processing times
 - Monitor error rates
 - Alert on failures
-
-## License
-
-MIT
-
-## Support
-
-For issues, questions, or contributions, please open an issue or pull request.
-
----
-
-**Built with ❤️ for Taygram**

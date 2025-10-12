@@ -1,4 +1,7 @@
-from node:20-alpine
+FROM node:20-alpine
+
+# Install FFmpeg which is required for video processing
+RUN apk add --no-cache ffmpeg
 
 WORKDIR /app
 

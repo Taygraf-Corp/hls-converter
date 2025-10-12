@@ -20,8 +20,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY!;
 const TARGET_BUCKET = process.env.TARGET_BUCKET || 'FlutterFlow';
 const TARGET_FOLDER = process.env.TARGET_FOLDER || 'converted';
-const PUBLIC_STORAGE_BASE_URL = process.env.PUBLIC_STORAGE_BASE_URL || 
-  'https://ohfzckfunpsjncjjzfyz.supabase.co/storage/v1/object/public/FlutterFlow/';
+const PUBLIC_STORAGE_BASE_URL = process.env.PUBLIC_STORAGE_BASE_URL; 
 
 // Initialize Supabase client
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);

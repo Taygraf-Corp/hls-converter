@@ -151,7 +151,7 @@ curl -X POST http://localhost:3000/api/upload \
 ```
 
 **Using the test page:**
-1. Open `examples/upload-test.html` in browser
+1. Open `localhost:3000` in browser
 2. Drag and drop a video
 3. Click "Upload & Process"
 
@@ -190,7 +190,7 @@ npm run migrate
 After processing, check your Supabase Storage:
 
 1. Go to Supabase Dashboard → Storage → `hls-videos`
-2. Navigate to `converted/{userId}/{videoId}/hls/`
+2. Navigate to `converted/{videoId}/hls/`
 3. You should see:
    - `master.m3u8` - Master playlist
    - `720p.m3u8`, `480p.m3u8` - Quality variants
@@ -200,7 +200,7 @@ After processing, check your Supabase Storage:
 
 Get the master playlist URL:
 ```
-https://YOUR_PROJECT.supabase.co/storage/v1/object/public/hls-videos/converted/user-123/video-456/hls/master.m3u8
+https://YOUR_PROJECT.supabase.co/storage/v1/object/public/hls-videos/converted/video-456/hls/master.m3u8
 ```
 
 Test in browser (Safari/iOS support HLS natively):
