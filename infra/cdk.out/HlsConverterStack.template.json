@@ -1,0 +1,945 @@
+{
+ "Description": "HLS Video Conversion Service - ECS Fargate deployment",
+ "Resources": {
+  "Repository22E53BBD": {
+   "Type": "AWS::ECR::Repository",
+   "Properties": {
+    "ImageScanningConfiguration": {
+     "ScanOnPush": true
+    },
+    "LifecyclePolicy": {
+     "LifecyclePolicyText": "{\"rules\":[{\"rulePriority\":1,\"description\":\"Keep only 10 images\",\"selection\":{\"tagStatus\":\"any\",\"countType\":\"imageCountMoreThan\",\"countNumber\":10},\"action\":{\"type\":\"expire\"}}]}"
+    },
+    "RepositoryName": "hls-converter"
+   },
+   "UpdateReplacePolicy": "Retain",
+   "DeletionPolicy": "Retain",
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/Repository/Resource"
+   }
+  },
+  "SecurityGroupDD263621": {
+   "Type": "AWS::EC2::SecurityGroup",
+   "Properties": {
+    "GroupDescription": "Security group for HLS Converter service",
+    "SecurityGroupEgress": [
+     {
+      "CidrIp": "0.0.0.0/0",
+      "Description": "Allow all outbound traffic by default",
+      "IpProtocol": "-1"
+     }
+    ],
+    "SecurityGroupIngress": [
+     {
+      "CidrIp": "0.0.0.0/0",
+      "Description": "Allow HTTP traffic",
+      "FromPort": 80,
+      "IpProtocol": "tcp",
+      "ToPort": 80
+     },
+     {
+      "CidrIp": "0.0.0.0/0",
+      "Description": "Allow HTTPS traffic",
+      "FromPort": 443,
+      "IpProtocol": "tcp",
+      "ToPort": 443
+     }
+    ],
+    "VpcId": "vpc-0bbb15df4829cabfe"
+   },
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/SecurityGroup/Resource"
+   }
+  },
+  "SecurityGroupfromHlsConverterStackSecurityGroup49FDA9D83000A7F49B20": {
+   "Type": "AWS::EC2::SecurityGroupIngress",
+   "Properties": {
+    "Description": "Load balancer to target",
+    "FromPort": 3000,
+    "GroupId": {
+     "Fn::GetAtt": [
+      "SecurityGroupDD263621",
+      "GroupId"
+     ]
+    },
+    "IpProtocol": "tcp",
+    "SourceSecurityGroupId": {
+     "Fn::GetAtt": [
+      "SecurityGroupDD263621",
+      "GroupId"
+     ]
+    },
+    "ToPort": 3000
+   },
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/SecurityGroup/from HlsConverterStackSecurityGroup49FDA9D8:3000"
+   }
+  },
+  "AppSecretsA1997F2A": {
+   "Type": "AWS::SecretsManager::Secret",
+   "Properties": {
+    "Description": "Secrets for HLS Converter service",
+    "GenerateSecretString": {
+     "GenerateStringKey": "dummy",
+     "SecretStringTemplate": "{\"SUPABASE_URL\":\"https://ohfzckfunpsjncjjzfyz.supabase.co\",\"SUPABASE_ANON_KEY\":\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9oZnpja2Z1bnBzam5jamp6Znl6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3MDczOTM1MzAsImV4cCI6MjAyMjk2OTUzMH0.EyiDASCJciqvCSDQqY5Cy50_RD65x4OdX6bU0KODHwg\",\"API_KEY\":\"S9CBjxQ6-nI4T-RdXF7bLzzqiUBzrxVR_ORmP60r9m4\"}"
+    },
+    "Name": "hls-converter/production"
+   },
+   "UpdateReplacePolicy": "Delete",
+   "DeletionPolicy": "Delete",
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/AppSecrets/Resource"
+   }
+  },
+  "LogGroupF5B46931": {
+   "Type": "AWS::Logs::LogGroup",
+   "Properties": {
+    "LogGroupName": "/ecs/hls-converter",
+    "RetentionInDays": 30
+   },
+   "UpdateReplacePolicy": "Delete",
+   "DeletionPolicy": "Delete",
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/LogGroup/Resource"
+   }
+  },
+  "ClusterEB0386A7": {
+   "Type": "AWS::ECS::Cluster",
+   "Properties": {
+    "ClusterName": "hls-converter-cluster",
+    "ClusterSettings": [
+     {
+      "Name": "containerInsights",
+      "Value": "enabled"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/Cluster/Resource"
+   }
+  },
+  "ExecutionRole605A040B": {
+   "Type": "AWS::IAM::Role",
+   "Properties": {
+    "AssumeRolePolicyDocument": {
+     "Statement": [
+      {
+       "Action": "sts:AssumeRole",
+       "Effect": "Allow",
+       "Principal": {
+        "Service": "ecs-tasks.amazonaws.com"
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "ManagedPolicyArns": [
+     {
+      "Fn::Join": [
+       "",
+       [
+        "arn:",
+        {
+         "Ref": "AWS::Partition"
+        },
+        ":iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+       ]
+      ]
+     }
+    ],
+    "RoleName": "hls-converter-execution-role"
+   },
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/ExecutionRole/Resource"
+   }
+  },
+  "ExecutionRoleDefaultPolicyA5B92313": {
+   "Type": "AWS::IAM::Policy",
+   "Properties": {
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": [
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetSecretValue"
+       ],
+       "Effect": "Allow",
+       "Resource": {
+        "Ref": "AppSecretsA1997F2A"
+       }
+      },
+      {
+       "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer"
+       ],
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::GetAtt": [
+         "Repository22E53BBD",
+         "Arn"
+        ]
+       }
+      },
+      {
+       "Action": "ecr:GetAuthorizationToken",
+       "Effect": "Allow",
+       "Resource": "*"
+      },
+      {
+       "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+       ],
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::GetAtt": [
+         "LogGroupF5B46931",
+         "Arn"
+        ]
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "PolicyName": "ExecutionRoleDefaultPolicyA5B92313",
+    "Roles": [
+     {
+      "Ref": "ExecutionRole605A040B"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/ExecutionRole/DefaultPolicy/Resource"
+   }
+  },
+  "TaskDefinitionTaskRoleFD40A61D": {
+   "Type": "AWS::IAM::Role",
+   "Properties": {
+    "AssumeRolePolicyDocument": {
+     "Statement": [
+      {
+       "Action": "sts:AssumeRole",
+       "Effect": "Allow",
+       "Principal": {
+        "Service": "ecs-tasks.amazonaws.com"
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/TaskDefinition/TaskRole/Resource"
+   }
+  },
+  "TaskDefinitionTaskRoleDefaultPolicy282E8624": {
+   "Type": "AWS::IAM::Policy",
+   "Properties": {
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": [
+        "logs:CreateLogStream",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+        "logs:PutLogEvents",
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel"
+       ],
+       "Effect": "Allow",
+       "Resource": "*"
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "PolicyName": "TaskDefinitionTaskRoleDefaultPolicy282E8624",
+    "Roles": [
+     {
+      "Ref": "TaskDefinitionTaskRoleFD40A61D"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/TaskDefinition/TaskRole/DefaultPolicy/Resource"
+   }
+  },
+  "TaskDefinitionB36D86D9": {
+   "Type": "AWS::ECS::TaskDefinition",
+   "Properties": {
+    "ContainerDefinitions": [
+     {
+      "Environment": [
+       {
+        "Name": "NODE_ENV",
+        "Value": "production"
+       },
+       {
+        "Name": "PORT",
+        "Value": "3000"
+       },
+       {
+        "Name": "SOURCE_BUCKET",
+        "Value": "FlutterFlow"
+       },
+       {
+        "Name": "TARGET_BUCKET",
+        "Value": "FlutterFlow"
+       },
+       {
+        "Name": "TARGET_FOLDER",
+        "Value": "converted"
+       },
+       {
+        "Name": "MAX_CONCURRENT_JOBS",
+        "Value": "3"
+       },
+       {
+        "Name": "TEMP_DIR",
+        "Value": "/app/temp"
+       }
+      ],
+      "Essential": true,
+      "HealthCheck": {
+       "Command": [
+        "CMD-SHELL",
+        "wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1"
+       ],
+       "Interval": 30,
+       "Retries": 3,
+       "StartPeriod": 60,
+       "Timeout": 10
+      },
+      "Image": {
+       "Fn::Join": [
+        "",
+        [
+         {
+          "Fn::Select": [
+           4,
+           {
+            "Fn::Split": [
+             ":",
+             {
+              "Fn::GetAtt": [
+               "Repository22E53BBD",
+               "Arn"
+              ]
+             }
+            ]
+           }
+          ]
+         },
+         ".dkr.ecr.",
+         {
+          "Fn::Select": [
+           3,
+           {
+            "Fn::Split": [
+             ":",
+             {
+              "Fn::GetAtt": [
+               "Repository22E53BBD",
+               "Arn"
+              ]
+             }
+            ]
+           }
+          ]
+         },
+         ".",
+         {
+          "Ref": "AWS::URLSuffix"
+         },
+         "/",
+         {
+          "Ref": "Repository22E53BBD"
+         },
+         ":latest"
+        ]
+       ]
+      },
+      "LogConfiguration": {
+       "LogDriver": "awslogs",
+       "Options": {
+        "awslogs-group": {
+         "Ref": "LogGroupF5B46931"
+        },
+        "awslogs-stream-prefix": "hls-converter",
+        "awslogs-region": "ca-central-1"
+       }
+      },
+      "Name": "hls-converter",
+      "PortMappings": [
+       {
+        "ContainerPort": 3000,
+        "Protocol": "tcp"
+       }
+      ],
+      "Secrets": [
+       {
+        "Name": "SUPABASE_URL",
+        "ValueFrom": {
+         "Fn::Join": [
+          "",
+          [
+           {
+            "Ref": "AppSecretsA1997F2A"
+           },
+           ":SUPABASE_URL::"
+          ]
+         ]
+        }
+       },
+       {
+        "Name": "SUPABASE_ANON_KEY",
+        "ValueFrom": {
+         "Fn::Join": [
+          "",
+          [
+           {
+            "Ref": "AppSecretsA1997F2A"
+           },
+           ":SUPABASE_ANON_KEY::"
+          ]
+         ]
+        }
+       },
+       {
+        "Name": "API_KEY",
+        "ValueFrom": {
+         "Fn::Join": [
+          "",
+          [
+           {
+            "Ref": "AppSecretsA1997F2A"
+           },
+           ":API_KEY::"
+          ]
+         ]
+        }
+       }
+      ]
+     }
+    ],
+    "Cpu": "2048",
+    "ExecutionRoleArn": {
+     "Fn::GetAtt": [
+      "ExecutionRole605A040B",
+      "Arn"
+     ]
+    },
+    "Family": "hls-converter",
+    "Memory": "4096",
+    "NetworkMode": "awsvpc",
+    "RequiresCompatibilities": [
+     "FARGATE"
+    ],
+    "TaskRoleArn": {
+     "Fn::GetAtt": [
+      "TaskDefinitionTaskRoleFD40A61D",
+      "Arn"
+     ]
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/TaskDefinition/Resource"
+   }
+  },
+  "ALBAEE750D2": {
+   "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+   "Properties": {
+    "LoadBalancerAttributes": [
+     {
+      "Key": "deletion_protection.enabled",
+      "Value": "false"
+     }
+    ],
+    "Name": "hls-converter-alb",
+    "Scheme": "internet-facing",
+    "SecurityGroups": [
+     {
+      "Fn::GetAtt": [
+       "SecurityGroupDD263621",
+       "GroupId"
+      ]
+     }
+    ],
+    "Subnets": [
+     "subnet-0e5532b21abc2a748",
+     "subnet-0c5d10cb339821665",
+     "subnet-0d92d4fbcfc065666"
+    ],
+    "Type": "application"
+   },
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/ALB/Resource"
+   }
+  },
+  "ALBHttpListener04CE8CD0": {
+   "Type": "AWS::ElasticLoadBalancingV2::Listener",
+   "Properties": {
+    "DefaultActions": [
+     {
+      "TargetGroupArn": {
+       "Ref": "TargetGroup3D7CD9B8"
+      },
+      "Type": "forward"
+     }
+    ],
+    "LoadBalancerArn": {
+     "Ref": "ALBAEE750D2"
+    },
+    "Port": 80,
+    "Protocol": "HTTP"
+   },
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/ALB/HttpListener/Resource"
+   }
+  },
+  "TargetGroup3D7CD9B8": {
+   "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+   "Properties": {
+    "HealthCheckEnabled": true,
+    "HealthCheckIntervalSeconds": 30,
+    "HealthCheckPath": "/health",
+    "HealthCheckTimeoutSeconds": 10,
+    "HealthyThresholdCount": 2,
+    "Matcher": {
+     "HttpCode": "200"
+    },
+    "Name": "hls-converter-tg",
+    "Port": 3000,
+    "Protocol": "HTTP",
+    "TargetGroupAttributes": [
+     {
+      "Key": "deregistration_delay.timeout_seconds",
+      "Value": "30"
+     },
+     {
+      "Key": "stickiness.enabled",
+      "Value": "false"
+     }
+    ],
+    "TargetType": "ip",
+    "UnhealthyThresholdCount": 3,
+    "VpcId": "vpc-0bbb15df4829cabfe"
+   },
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/TargetGroup/Resource"
+   }
+  },
+  "ServiceD69D759B": {
+   "Type": "AWS::ECS::Service",
+   "Properties": {
+    "Cluster": {
+     "Ref": "ClusterEB0386A7"
+    },
+    "DeploymentConfiguration": {
+     "Alarms": {
+      "AlarmNames": [],
+      "Enable": false,
+      "Rollback": false
+     },
+     "DeploymentCircuitBreaker": {
+      "Enable": true,
+      "Rollback": true
+     },
+     "MaximumPercent": 200,
+     "MinimumHealthyPercent": 50
+    },
+    "DesiredCount": 1,
+    "EnableECSManagedTags": false,
+    "EnableExecuteCommand": true,
+    "HealthCheckGracePeriodSeconds": 60,
+    "LaunchType": "FARGATE",
+    "LoadBalancers": [
+     {
+      "ContainerName": "hls-converter",
+      "ContainerPort": 3000,
+      "TargetGroupArn": {
+       "Ref": "TargetGroup3D7CD9B8"
+      }
+     }
+    ],
+    "NetworkConfiguration": {
+     "AwsvpcConfiguration": {
+      "AssignPublicIp": "ENABLED",
+      "SecurityGroups": [
+       {
+        "Fn::GetAtt": [
+         "SecurityGroupDD263621",
+         "GroupId"
+        ]
+       }
+      ],
+      "Subnets": [
+       "subnet-0e5532b21abc2a748",
+       "subnet-0c5d10cb339821665",
+       "subnet-0d92d4fbcfc065666"
+      ]
+     }
+    },
+    "ServiceName": "hls-converter-service",
+    "TaskDefinition": {
+     "Ref": "TaskDefinitionB36D86D9"
+    }
+   },
+   "DependsOn": [
+    "ALBHttpListener04CE8CD0",
+    "TaskDefinitionTaskRoleDefaultPolicy282E8624",
+    "TaskDefinitionTaskRoleFD40A61D"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/Service/Service"
+   }
+  },
+  "ServiceTaskCountTarget23E25614": {
+   "Type": "AWS::ApplicationAutoScaling::ScalableTarget",
+   "Properties": {
+    "MaxCapacity": 5,
+    "MinCapacity": 1,
+    "ResourceId": {
+     "Fn::Join": [
+      "",
+      [
+       "service/",
+       {
+        "Ref": "ClusterEB0386A7"
+       },
+       "/",
+       {
+        "Fn::GetAtt": [
+         "ServiceD69D759B",
+         "Name"
+        ]
+       }
+      ]
+     ]
+    },
+    "RoleARN": "arn:aws:iam::442956083883:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService",
+    "ScalableDimension": "ecs:service:DesiredCount",
+    "ServiceNamespace": "ecs"
+   },
+   "DependsOn": [
+    "TaskDefinitionTaskRoleDefaultPolicy282E8624",
+    "TaskDefinitionTaskRoleFD40A61D"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/Service/TaskCount/Target/Resource"
+   }
+  },
+  "ServiceTaskCountTargetCpuScalingCC8A5DF6": {
+   "Type": "AWS::ApplicationAutoScaling::ScalingPolicy",
+   "Properties": {
+    "PolicyName": "HlsConverterStackServiceTaskCountTargetCpuScaling23386EE0",
+    "PolicyType": "TargetTrackingScaling",
+    "ScalingTargetId": {
+     "Ref": "ServiceTaskCountTarget23E25614"
+    },
+    "TargetTrackingScalingPolicyConfiguration": {
+     "PredefinedMetricSpecification": {
+      "PredefinedMetricType": "ECSServiceAverageCPUUtilization"
+     },
+     "ScaleInCooldown": 120,
+     "ScaleOutCooldown": 60,
+     "TargetValue": 70
+    }
+   },
+   "DependsOn": [
+    "TaskDefinitionTaskRoleDefaultPolicy282E8624",
+    "TaskDefinitionTaskRoleFD40A61D"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/Service/TaskCount/Target/CpuScaling/Resource"
+   }
+  },
+  "ServiceTaskCountTargetMemoryScalingEA4B07C8": {
+   "Type": "AWS::ApplicationAutoScaling::ScalingPolicy",
+   "Properties": {
+    "PolicyName": "HlsConverterStackServiceTaskCountTargetMemoryScaling70996F73",
+    "PolicyType": "TargetTrackingScaling",
+    "ScalingTargetId": {
+     "Ref": "ServiceTaskCountTarget23E25614"
+    },
+    "TargetTrackingScalingPolicyConfiguration": {
+     "PredefinedMetricSpecification": {
+      "PredefinedMetricType": "ECSServiceAverageMemoryUtilization"
+     },
+     "ScaleInCooldown": 120,
+     "ScaleOutCooldown": 60,
+     "TargetValue": 80
+    }
+   },
+   "DependsOn": [
+    "TaskDefinitionTaskRoleDefaultPolicy282E8624",
+    "TaskDefinitionTaskRoleFD40A61D"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/Service/TaskCount/Target/MemoryScaling/Resource"
+   }
+  },
+  "ServiceTaskCountTargetRequestScalingBFFEE294": {
+   "Type": "AWS::ApplicationAutoScaling::ScalingPolicy",
+   "Properties": {
+    "PolicyName": "HlsConverterStackServiceTaskCountTargetRequestScaling9793BD52",
+    "PolicyType": "TargetTrackingScaling",
+    "ScalingTargetId": {
+     "Ref": "ServiceTaskCountTarget23E25614"
+    },
+    "TargetTrackingScalingPolicyConfiguration": {
+     "PredefinedMetricSpecification": {
+      "PredefinedMetricType": "ALBRequestCountPerTarget",
+      "ResourceLabel": {
+       "Fn::Join": [
+        "",
+        [
+         {
+          "Fn::Select": [
+           1,
+           {
+            "Fn::Split": [
+             "/",
+             {
+              "Ref": "ALBHttpListener04CE8CD0"
+             }
+            ]
+           }
+          ]
+         },
+         "/",
+         {
+          "Fn::Select": [
+           2,
+           {
+            "Fn::Split": [
+             "/",
+             {
+              "Ref": "ALBHttpListener04CE8CD0"
+             }
+            ]
+           }
+          ]
+         },
+         "/",
+         {
+          "Fn::Select": [
+           3,
+           {
+            "Fn::Split": [
+             "/",
+             {
+              "Ref": "ALBHttpListener04CE8CD0"
+             }
+            ]
+           }
+          ]
+         },
+         "/",
+         {
+          "Fn::GetAtt": [
+           "TargetGroup3D7CD9B8",
+           "TargetGroupFullName"
+          ]
+         }
+        ]
+       ]
+      }
+     },
+     "ScaleInCooldown": 120,
+     "ScaleOutCooldown": 60,
+     "TargetValue": 100
+    }
+   },
+   "DependsOn": [
+    "TaskDefinitionTaskRoleDefaultPolicy282E8624",
+    "TaskDefinitionTaskRoleFD40A61D"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/Service/TaskCount/Target/RequestScaling/Resource"
+   }
+  },
+  "CDKMetadata": {
+   "Type": "AWS::CDK::Metadata",
+   "Properties": {
+    "Analytics": "v2:deflate64:H4sIAAAAAAAA/32QUU8CMQzHP4vvY+JpfFeMxsREw/FuyqhLYWyXtsOQZd/d3B0I+OBT//33t3ZtY5vbezu9gm+ZuNVmEmhpS6vgNga+5bOgY1vm2CUhTbw3s694yqpB19jSostMun/hlLue+N94jZ5RpBpBx6iyhQgeeejDqAeeUasJyYstb8n/djrqfrTYMgtZFLmvHOUzsAfFBcjmCb8oklKKPfDXSVGBIvKZd3jbIu/I4fiTUbYOAizD0HaWctRqCLa2zFMYuCF+pEBuuNGoqsEAouRCgtUSAkRH0e8aWx66LpCDfuhbgtXjUBv3uMjPORLFeGCO+qy+APaov4c6S6uBEwZZkzgIFL0tp616eNj30hnDgsFtKPp2fHda88Ko1cxRUubxcu9Zu6zVxLRCu5brXXNnbxo7vVoL0YRzVNqinY/xBzJR9DyHAgAA"
+   },
+   "Metadata": {
+    "aws:cdk:path": "HlsConverterStack/CDKMetadata/Default"
+   }
+  }
+ },
+ "Outputs": {
+  "RepositoryUri": {
+   "Description": "ECR Repository URI",
+   "Value": {
+    "Fn::Join": [
+     "",
+     [
+      {
+       "Fn::Select": [
+        4,
+        {
+         "Fn::Split": [
+          ":",
+          {
+           "Fn::GetAtt": [
+            "Repository22E53BBD",
+            "Arn"
+           ]
+          }
+         ]
+        }
+       ]
+      },
+      ".dkr.ecr.",
+      {
+       "Fn::Select": [
+        3,
+        {
+         "Fn::Split": [
+          ":",
+          {
+           "Fn::GetAtt": [
+            "Repository22E53BBD",
+            "Arn"
+           ]
+          }
+         ]
+        }
+       ]
+      },
+      ".",
+      {
+       "Ref": "AWS::URLSuffix"
+      },
+      "/",
+      {
+       "Ref": "Repository22E53BBD"
+      }
+     ]
+    ]
+   },
+   "Export": {
+    "Name": "HlsConverterRepositoryUri"
+   }
+  },
+  "RepositoryName": {
+   "Description": "ECR Repository Name",
+   "Value": {
+    "Ref": "Repository22E53BBD"
+   },
+   "Export": {
+    "Name": "HlsConverterRepositoryName"
+   }
+  },
+  "LoadBalancerDNS": {
+   "Description": "Load Balancer DNS Name",
+   "Value": {
+    "Fn::GetAtt": [
+     "ALBAEE750D2",
+     "DNSName"
+    ]
+   },
+   "Export": {
+    "Name": "HlsConverterLoadBalancerDNS"
+   }
+  },
+  "ApiUrl": {
+   "Description": "API URL",
+   "Value": {
+    "Fn::Join": [
+     "",
+     [
+      "http://",
+      {
+       "Fn::GetAtt": [
+        "ALBAEE750D2",
+        "DNSName"
+       ]
+      }
+     ]
+    ]
+   },
+   "Export": {
+    "Name": "HlsConverterApiUrl"
+   }
+  },
+  "ClusterName": {
+   "Description": "ECS Cluster Name",
+   "Value": {
+    "Ref": "ClusterEB0386A7"
+   },
+   "Export": {
+    "Name": "HlsConverterClusterName"
+   }
+  },
+  "ServiceName": {
+   "Description": "ECS Service Name",
+   "Value": {
+    "Fn::GetAtt": [
+     "ServiceD69D759B",
+     "Name"
+    ]
+   },
+   "Export": {
+    "Name": "HlsConverterServiceName"
+   }
+  },
+  "SecretsArn": {
+   "Description": "Secrets Manager ARN - Update secrets here",
+   "Value": {
+    "Ref": "AppSecretsA1997F2A"
+   },
+   "Export": {
+    "Name": "HlsConverterSecretsArn"
+   }
+  },
+  "LogGroupName": {
+   "Description": "CloudWatch Log Group Name",
+   "Value": {
+    "Ref": "LogGroupF5B46931"
+   },
+   "Export": {
+    "Name": "HlsConverterLogGroupName"
+   }
+  }
+ },
+ "Parameters": {
+  "BootstrapVersion": {
+   "Type": "AWS::SSM::Parameter::Value<String>",
+   "Default": "/cdk-bootstrap/hnb659fds/version",
+   "Description": "Version of the CDK Bootstrap resources in this environment, automatically retrieved from SSM Parameter Store. [cdk:skip]"
+  }
+ },
+ "Rules": {
+  "CheckBootstrapVersion": {
+   "Assertions": [
+    {
+     "Assert": {
+      "Fn::Not": [
+       {
+        "Fn::Contains": [
+         [
+          "1",
+          "2",
+          "3",
+          "4",
+          "5"
+         ],
+         {
+          "Ref": "BootstrapVersion"
+         }
+        ]
+       }
+      ]
+     },
+     "AssertDescription": "CDK bootstrap stack version 6 required. Please run 'cdk bootstrap' with a recent version of the CDK CLI."
+    }
+   ]
+  }
+ }
+}

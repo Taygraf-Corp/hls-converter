@@ -13,7 +13,13 @@
     "migrate": "tsx src/migrate.ts",
     "sync-hls-urls": "tsx scripts/sync-hls-urls.ts",
     "generate-key": "tsx scripts/generate-api-key.ts",
-    "test": "jest"
+    "test": "jest",
+    "deploy": "./scripts/deploy.sh",
+    "deploy:infra": "./scripts/deploy.sh --infra-only",
+    "deploy:image": "./scripts/deploy.sh --image-only",
+    "cdk:synth": "cd infra && npx cdk synth",
+    "cdk:diff": "cd infra && npx cdk diff",
+    "cdk:destroy": "cd infra && npx cdk destroy"
   },
   "keywords": [
     "video",
