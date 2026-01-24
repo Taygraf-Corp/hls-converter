@@ -5,16 +5,42 @@
 http://localhost:3000
 ```
 
+## Authentication
+
+Set in `.env`:
+```bash
+API_KEY=your-secret-key-here
+```
+
+Generate a key:
+```bash
+npm run generate-key
+```
+
+Include in requests (choose one method):
+```bash
+# Method 1: Authorization Header
+-H "Authorization: Bearer your-api-key-here"
+
+# Method 2: X-API-Key Header
+-H "X-API-Key: your-api-key-here"
+
+# Method 3: Query Parameter
+?api_key=your-api-key-here
+```
+
+---
+
 ## Endpoints at a Glance
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/health` | Check service health |
-| GET | `/api/info` | Get service configuration |
-| POST | `/api/upload` | Upload & convert video |
-| POST | `/api/validate` | Validate video file |
-| POST | `/api/metadata` | Get video metadata |
-| POST | `/api/process-from-storage` | Process stored video |
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/health` | No | Check service health |
+| GET | `/api/info` | No | Get service configuration |
+| POST | `/api/upload` | Yes | Upload & convert video |
+| POST | `/api/validate` | Yes | Validate video file |
+| POST | `/api/metadata` | Yes | Get video metadata |
+| POST | `/api/process-from-storage` | Yes | Process stored video |
 
 ---
 
@@ -23,6 +49,7 @@ http://localhost:3000
 ### Upload Video
 ```bash
 curl -X POST http://localhost:3000/api/upload \
+  -H "Authorization: Bearer your-api-key-here" \
   -F "video=@video.mp4" \
   -F "videoId=my-video-123"
 ```
@@ -30,6 +57,7 @@ curl -X POST http://localhost:3000/api/upload \
 ### Validate Video
 ```bash
 curl -X POST http://localhost:3000/api/validate \
+  -H "Authorization: Bearer your-api-key-here" \
   -F "video=@video.mp4"
 ```
 
@@ -37,6 +65,7 @@ curl -X POST http://localhost:3000/api/validate \
 ```bash
 curl -X POST http://localhost:3000/api/metadata \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key-here" \
   -d '{"videoPath":"Videos/video.mp4"}'
 ```
 
@@ -44,6 +73,7 @@ curl -X POST http://localhost:3000/api/metadata \
 ```bash
 curl -X POST http://localhost:3000/api/process-from-storage \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key-here" \
   -d '{"videoPath":"Videos/video.mp4","videoId":"video-123"}'
 ```
 

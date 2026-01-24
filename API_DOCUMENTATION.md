@@ -740,15 +740,16 @@ upload_video('./my-video.mp4', 'video-123', api_key)
 #### Get Metadata
 
 ```python
-def get_metadata(video_path):
+def get_metadata(video_path, api_key):
     url = 'http://localhost:3000/api/metadata'
+    headers = {'Authorization': f'Bearer {api_key}'}
     
     payload = {
         'videoPath': video_path,
         'bucket': 'FlutterFlow'
     }
     
-    response = requests.post(url, json=payload)
+    response = requests.post(url, json=payload, headers=headers)
     
     if response.status_code == 200:
         result = response.json()
@@ -759,7 +760,7 @@ def get_metadata(video_path):
         return None
 
 # Usage
-get_metadata('Videos/my-video.mp4')
+get_metadata('Videos/my-video.mp4', api_key)
 ```
 
 ---
@@ -770,6 +771,7 @@ get_metadata('Videos/my-video.mp4')
 
 ```bash
 curl -X POST http://localhost:3000/api/upload \
+  -H "Authorization: Bearer your-api-key-here" \
   -F "video=@./my-video.mp4" \
   -F "videoId=video-123" \
   -F "userId=user-456"
@@ -779,6 +781,7 @@ curl -X POST http://localhost:3000/api/upload \
 
 ```bash
 curl -X POST http://localhost:3000/api/validate \
+  -H "Authorization: Bearer your-api-key-here" \
   -F "video=@./my-video.mp4"
 ```
 
@@ -787,6 +790,7 @@ curl -X POST http://localhost:3000/api/validate \
 ```bash
 curl -X POST http://localhost:3000/api/metadata \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key-here" \
   -d '{"videoPath":"Videos/my-video.mp4","bucket":"FlutterFlow"}'
 ```
 
@@ -795,6 +799,7 @@ curl -X POST http://localhost:3000/api/metadata \
 ```bash
 curl -X POST http://localhost:3000/api/process-from-storage \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key-here" \
   -d '{
     "videoPath": "Videos/my-video.mp4",
     "videoId": "video-123",
@@ -807,7 +812,7 @@ curl -X POST http://localhost:3000/api/process-from-storage \
 ### React/Frontend
 
 ```javascript
-async function uploadVideoFromBrowser(file, videoId) {
+async function uploadVideoFromBrowser(file, videoId, apiKey) {
   const formData = new FormData();
   formData.append('video', file);
   formData.append('videoId', videoId);
@@ -815,6 +820,9 @@ async function uploadVideoFromBrowser(file, videoId) {
   try {
     const response = await fetch('http://localhost:3000/api/upload', {
       method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`
+      },
       body: formData
     });
     
@@ -839,11 +847,13 @@ async function uploadVideoFromBrowser(file, videoId) {
 
 // Example with file input
 function VideoUploader() {
+  const apiKey = process.env.REACT_APP_API_KEY || 'your-api-key-here';
+  
   const handleFileChange = async (event) => {
     const file = event.target.files[0];
     if (file) {
       const videoId = `video-${Date.now()}`;
-      await uploadVideoFromBrowser(file, videoId);
+      await uploadVideoFromBrowser(file, videoId, apiKey);
     }
   };
   
