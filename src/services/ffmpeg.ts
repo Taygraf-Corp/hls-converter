@@ -389,6 +389,10 @@ export class FFmpegService {
           '-crf', '23',
           '-maxrate', (resolution.bitrate * 1.2).toString(),
           '-bufsize', (resolution.bitrate * 2).toString(),
+          // Fix for low-framerate videos and audio/video sync issues
+          '-max_muxing_queue_size', '9999',
+          '-vsync', 'cfr',
+          '-async', '1',
           '-start_number', '0',
           '-hls_time', options.hlsSegmentDuration.toString(),
           '-hls_list_size', '0',

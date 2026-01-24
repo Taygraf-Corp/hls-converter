@@ -421,7 +421,7 @@ app.post('/api/metadata', authenticate, express.json(), async (req: Request, res
  */
 app.post('/api/process-from-storage', authenticate, express.json(), async (req: Request, res: Response) => {
   try {
-    const { videoPath, bucket, userId, videoId } = req.body;
+    const { videoPath, bucket, userId, videoId, postId } = req.body;
 
     if (!videoPath) {
       return res.status(400).json({
@@ -447,7 +447,7 @@ app.post('/api/process-from-storage', authenticate, express.json(), async (req: 
     await storageService.downloadFile(videoFile, tempPath);
 
     // Process the video
-    const result = await processVideo(tempPath, videoFile.name, { userId, videoId });
+    const result = await processVideo(tempPath, videoFile.name, { userId, videoId, postId });
 
     // Cleanup
     await cleanup([tempDir]);

@@ -22,7 +22,17 @@ export class SupabaseStorageService {
   }
 
   async updatePost(postId: string, data: any): Promise<void> {
-    await this.adminClient.from('posts').update(data).eq('id', postId);
+    const { data: result, error } = await this.adminClient
+      .from('posts')
+      .update(data)
+      .eq('id', postId)
+      .select();
+    
+    if (error) {
+      throw new Error(`Failed to update post ${postId}: ${error.message}`);
+    }
+    
+    logger.info(`Successfully updated post ${postId} with data:`, data);
   }
 
   /**

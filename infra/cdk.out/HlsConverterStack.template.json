@@ -1,23 +1,6 @@
 {
  "Description": "HLS Video Conversion Service - ECS Fargate deployment",
  "Resources": {
-  "Repository22E53BBD": {
-   "Type": "AWS::ECR::Repository",
-   "Properties": {
-    "ImageScanningConfiguration": {
-     "ScanOnPush": true
-    },
-    "LifecyclePolicy": {
-     "LifecyclePolicyText": "{\"rules\":[{\"rulePriority\":1,\"description\":\"Keep only 10 images\",\"selection\":{\"tagStatus\":\"any\",\"countType\":\"imageCountMoreThan\",\"countNumber\":10},\"action\":{\"type\":\"expire\"}}]}"
-    },
-    "RepositoryName": "hls-converter"
-   },
-   "UpdateReplacePolicy": "Retain",
-   "DeletionPolicy": "Retain",
-   "Metadata": {
-    "aws:cdk:path": "HlsConverterStack/Repository/Resource"
-   }
-  },
   "SecurityGroupDD263621": {
    "Type": "AWS::EC2::SecurityGroup",
    "Properties": {
@@ -175,12 +158,7 @@
         "ecr:GetDownloadUrlForLayer"
        ],
        "Effect": "Allow",
-       "Resource": {
-        "Fn::GetAtt": [
-         "Repository22E53BBD",
-         "Arn"
-        ]
-       }
+       "Resource": "arn:aws:ecr:ca-central-1:442956083883:repository/hls-converter"
       },
       {
        "Action": "ecr:GetAuthorizationToken",
@@ -317,48 +295,11 @@
        "Fn::Join": [
         "",
         [
-         {
-          "Fn::Select": [
-           4,
-           {
-            "Fn::Split": [
-             ":",
-             {
-              "Fn::GetAtt": [
-               "Repository22E53BBD",
-               "Arn"
-              ]
-             }
-            ]
-           }
-          ]
-         },
-         ".dkr.ecr.",
-         {
-          "Fn::Select": [
-           3,
-           {
-            "Fn::Split": [
-             ":",
-             {
-              "Fn::GetAtt": [
-               "Repository22E53BBD",
-               "Arn"
-              ]
-             }
-            ]
-           }
-          ]
-         },
-         ".",
+         "442956083883.dkr.ecr.ca-central-1.",
          {
           "Ref": "AWS::URLSuffix"
          },
-         "/",
-         {
-          "Ref": "Repository22E53BBD"
-         },
-         ":latest"
+         "/hls-converter:latest"
         ]
        ]
       },
@@ -765,7 +706,7 @@
   "CDKMetadata": {
    "Type": "AWS::CDK::Metadata",
    "Properties": {
-    "Analytics": "v2:deflate64:H4sIAAAAAAAA/32QUU8CMQzHP4vvY+JpfFeMxsREw/FuyqhLYWyXtsOQZd/d3B0I+OBT//33t3ZtY5vbezu9gm+ZuNVmEmhpS6vgNga+5bOgY1vm2CUhTbw3s694yqpB19jSostMun/hlLue+N94jZ5RpBpBx6iyhQgeeejDqAeeUasJyYstb8n/djrqfrTYMgtZFLmvHOUzsAfFBcjmCb8oklKKPfDXSVGBIvKZd3jbIu/I4fiTUbYOAizD0HaWctRqCLa2zFMYuCF+pEBuuNGoqsEAouRCgtUSAkRH0e8aWx66LpCDfuhbgtXjUBv3uMjPORLFeGCO+qy+APaov4c6S6uBEwZZkzgIFL0tp616eNj30hnDgsFtKPp2fHda88Ko1cxRUubxcu9Zu6zVxLRCu5brXXNnbxo7vVoL0YRzVNqinY/xBzJR9DyHAgAA"
+    "Analytics": "v2:deflate64:H4sIAAAAAAAA/31QQW4CMQx8C/eQ0m3Ve0vVqhJSK5Z7ZYKJDCFZ2Q4IrfL3anehQA89eTweTzKubPXwZCcjOMjYrbbjQEvb1gpua+Ag3y06tnNskpAmPr6AoEFX2bZGl5n0+M4pN2a6jv8TH9EzihQj6BhVdhDBI/c+jHrSM2oxIXmx7Sz5X6czLgad2HYasihyNznDN2APiguQ7SuuKZJSip3gL5OiAkXkK+60WyPvyeHwkwHWDgIsQ287TTlqMQQ7285T6HV9/UqB3LFrB1QMBhAlFxKslhAgOop+X9n2uWkCOegenSVYvfSzIcdNf60jUYwnzRlfzRfAHvX3UFdtMXCRQdYkDgJFb9tLqk7c571lhrJgcFuKvh72LjFviFLMHCVlHi73mbXJWkxMK7QbudtXj/a+spPRRojGnKPSDu18qD9nI87/ewIAAA=="
    },
    "Metadata": {
     "aws:cdk:path": "HlsConverterStack/CDKMetadata/Default"
@@ -779,47 +720,11 @@
     "Fn::Join": [
      "",
      [
-      {
-       "Fn::Select": [
-        4,
-        {
-         "Fn::Split": [
-          ":",
-          {
-           "Fn::GetAtt": [
-            "Repository22E53BBD",
-            "Arn"
-           ]
-          }
-         ]
-        }
-       ]
-      },
-      ".dkr.ecr.",
-      {
-       "Fn::Select": [
-        3,
-        {
-         "Fn::Split": [
-          ":",
-          {
-           "Fn::GetAtt": [
-            "Repository22E53BBD",
-            "Arn"
-           ]
-          }
-         ]
-        }
-       ]
-      },
-      ".",
+      "442956083883.dkr.ecr.ca-central-1.",
       {
        "Ref": "AWS::URLSuffix"
       },
-      "/",
-      {
-       "Ref": "Repository22E53BBD"
-      }
+      "/hls-converter"
      ]
     ]
    },
@@ -829,9 +734,7 @@
   },
   "RepositoryName": {
    "Description": "ECR Repository Name",
-   "Value": {
-    "Ref": "Repository22E53BBD"
-   },
+   "Value": "hls-converter",
    "Export": {
     "Name": "HlsConverterRepositoryName"
    }

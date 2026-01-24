@@ -37,20 +37,15 @@ export class HlsConverterStack extends cdk.Stack {
     const { config } = props;
 
     // ============================================
-    // ECR Repository
+    // ECR Repository - Use existing repository
     // ============================================
-    this.repository = new ecr.Repository(this, 'Repository', {
-      repositoryName: 'hls-converter',
-      imageScanOnPush: true,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-      lifecycleRules: [
-        {
-          maxImageCount: 10,
-          rulePriority: 1,
-          description: 'Keep only 10 images',
-        },
-      ],
-    });
+    // The repository was created manually or in a previous deployment
+    // We reference it by name to avoid conflicts
+    this.repository = ecr.Repository.fromRepositoryName(
+      this,
+      'Repository',
+      'hls-converter'
+    ) as ecr.Repository;
 
     // ============================================
     // VPC - Use default VPC

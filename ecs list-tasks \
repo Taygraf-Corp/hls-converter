@@ -1,0 +1,165 @@
+{
+    "services": [
+        {
+            "serviceArn": "arn:aws:ecs:ca-central-1:442956083883:service/hls-converter-cluster/hls-converter-service",
+            "serviceName": "hls-converter-service",
+            "clusterArn": "arn:aws:ecs:ca-central-1:442956083883:cluster/hls-converter-cluster",
+            "loadBalancers": [
+                {
+                    "targetGroupArn": "arn:aws:elasticloadbalancing:ca-central-1:442956083883:targetgroup/hls-converter-tg/1cab41f93a9b9f76",
+                    "containerName": "hls-converter",
+                    "containerPort": 3000
+                }
+            ],
+            "serviceRegistries": [],
+            "status": "DRAINING",
+            "desiredCount": 0,
+            "runningCount": 0,
+            "pendingCount": 0,
+            "launchType": "FARGATE",
+            "platformVersion": "LATEST",
+            "platformFamily": "Linux",
+            "taskDefinition": "arn:aws:ecs:ca-central-1:442956083883:task-definition/hls-converter:1",
+            "deploymentConfiguration": {
+                "deploymentCircuitBreaker": {
+                    "enable": true,
+                    "rollback": true
+                },
+                "maximumPercent": 200,
+                "minimumHealthyPercent": 50,
+                "alarms": {
+                    "alarmNames": [],
+                    "rollback": false,
+                    "enable": false
+                },
+                "strategy": "ROLLING",
+                "bakeTimeInMinutes": 0
+            },
+            "deployments": [
+                {
+                    "id": "ecs-svc/3102370832049738542",
+                    "status": "PRIMARY",
+                    "taskDefinition": "arn:aws:ecs:ca-central-1:442956083883:task-definition/hls-converter:1",
+                    "desiredCount": 0,
+                    "pendingCount": 0,
+                    "runningCount": 0,
+                    "failedTasks": 0,
+                    "createdAt": "2026-01-24T12:02:16.095000-05:00",
+                    "updatedAt": "2026-01-24T12:10:33.799000-05:00",
+                    "launchType": "FARGATE",
+                    "platformVersion": "1.4.0",
+                    "platformFamily": "Linux",
+                    "networkConfiguration": {
+                        "awsvpcConfiguration": {
+                            "subnets": [
+                                "subnet-0c5d10cb339821665",
+                                "subnet-0d92d4fbcfc065666",
+                                "subnet-0e5532b21abc2a748"
+                            ],
+                            "securityGroups": [
+                                "sg-0b133707281472f76"
+                            ],
+                            "assignPublicIp": "ENABLED"
+                        }
+                    },
+                    "rolloutState": "COMPLETED",
+                    "rolloutStateReason": "ECS deployment ecs-svc/3102370832049738542 completed."
+                }
+            ],
+            "roleArn": "arn:aws:iam::442956083883:role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS",
+            "events": [
+                {
+                    "id": "ae937aab-5e04-4890-8f05-dd603c947389",
+                    "createdAt": "2026-01-24T12:10:33.808000-05:00",
+                    "message": "(service hls-converter-service) has reached a steady state."
+                },
+                {
+                    "id": "40baee90-564e-4fcd-aa74-7e7a470c5d3d",
+                    "createdAt": "2026-01-24T12:10:33.807000-05:00",
+                    "message": "(service hls-converter-service) (deployment ecs-svc/3102370832049738542) deployment completed."
+                },
+                {
+                    "id": "d20d1a62-3f03-48e5-a1f2-27084ce69d69",
+                    "createdAt": "2026-01-24T12:10:02.020000-05:00",
+                    "message": "(service hls-converter-service) was unable to place a task. Reason: CannotPullContainerError: pull image manifest has been retried 7 time(s): failed to resolve ref 442956083883.dkr.ecr.ca-central-1.amazonaws.com/hls-converter:latest: 442956083883.dkr.ecr.ca-central-1.amazonaws.com/hls-converter:latest: not found."
+                },
+                {
+                    "id": "4a3f0c70-ff1a-4e73-b246-2aeead890c05",
+                    "createdAt": "2026-01-24T12:09:53.820000-05:00",
+                    "message": "(service hls-converter-service) (deployment ecs-svc/3102370832049738542) deployment failed: tasks failed to start."
+                },
+                {
+                    "id": "6304c54f-4959-4b22-84ad-bd88cdebe8a1",
+                    "createdAt": "2026-01-24T12:08:38.470000-05:00",
+                    "message": "(service hls-converter-service) has started 1 tasks: (task bbd2e620a2f343cbb29a133ddc6446cb)."
+                },
+                {
+                    "id": "45ecfdb9-1d14-4472-a594-96c775c5b9c2",
+                    "createdAt": "2026-01-24T12:08:06.364000-05:00",
+                    "message": "(service hls-converter-service) was unable to place a task. Reason: CannotPullContainerError: pull image manifest has been retried 7 time(s): failed to resolve ref 442956083883.dkr.ecr.ca-central-1.amazonaws.com/hls-converter:latest: 442956083883.dkr.ecr.ca-central-1.amazonaws.com/hls-converter:latest: not found."
+                },
+                {
+                    "id": "e34f7fa3-e34c-49c2-aced-7078ca1fa5c4",
+                    "createdAt": "2026-01-24T12:06:31.702000-05:00",
+                    "message": "(service hls-converter-service) has started 1 tasks: (task 20956156658d4679aaf61a321a54d58b)."
+                },
+                {
+                    "id": "7742b4d8-4e48-4b6a-9570-2a5de4871182",
+                    "createdAt": "2026-01-24T12:06:00.797000-05:00",
+                    "message": "(service hls-converter-service) was unable to place a task. Reason: CannotPullContainerError: pull image manifest has been retried 7 time(s): failed to resolve ref 442956083883.dkr.ecr.ca-central-1.amazonaws.com/hls-converter:latest: 442956083883.dkr.ecr.ca-central-1.amazonaws.com/hls-converter:latest: not found."
+                },
+                {
+                    "id": "6d40fb78-c5ae-4424-a776-6aa4deb96be3",
+                    "createdAt": "2026-01-24T12:04:35.943000-05:00",
+                    "message": "(service hls-converter-service) has started 1 tasks: (task 63e4a6b27e8b4685a590f6710b3d0700)."
+                },
+                {
+                    "id": "5bf5b2ee-319c-48e1-a750-3e09bf3b5a77",
+                    "createdAt": "2026-01-24T12:04:03.945000-05:00",
+                    "message": "(service hls-converter-service) was unable to place a task. Reason: CannotPullContainerError: pull image manifest has been retried 7 time(s): failed to resolve ref 442956083883.dkr.ecr.ca-central-1.amazonaws.com/hls-converter:latest: 442956083883.dkr.ecr.ca-central-1.amazonaws.com/hls-converter:latest: not found."
+                },
+                {
+                    "id": "055937dc-ab0a-4d14-9527-05939dd6597d",
+                    "createdAt": "2026-01-24T12:02:39.011000-05:00",
+                    "message": "(service hls-converter-service) has started 1 tasks: (task a6b5bbe3e5794524a9b9185aabbaeed3)."
+                }
+            ],
+            "createdAt": "2026-01-24T12:02:16.095000-05:00",
+            "currentServiceRevisions": [
+                {
+                    "arn": "arn:aws:ecs:ca-central-1:442956083883:service-revision/hls-converter-cluster/hls-converter-service/3102370832049738542",
+                    "requestedTaskCount": 0,
+                    "runningTaskCount": 0,
+                    "pendingTaskCount": 0
+                }
+            ],
+            "placementConstraints": [],
+            "placementStrategy": [],
+            "networkConfiguration": {
+                "awsvpcConfiguration": {
+                    "subnets": [
+                        "subnet-0c5d10cb339821665",
+                        "subnet-0d92d4fbcfc065666",
+                        "subnet-0e5532b21abc2a748"
+                    ],
+                    "securityGroups": [
+                        "sg-0b133707281472f76"
+                    ],
+                    "assignPublicIp": "ENABLED"
+                }
+            },
+            "healthCheckGracePeriodSeconds": 60,
+            "schedulingStrategy": "REPLICA",
+            "deploymentController": {
+                "type": "ECS"
+            },
+            "createdBy": "arn:aws:iam::442956083883:role/cdk-hnb659fds-cfn-exec-role-442956083883-ca-central-1",
+            "enableECSManagedTags": false,
+            "propagateTags": "NONE",
+            "enableExecuteCommand": true,
+            "availabilityZoneRebalancing": "ENABLED",
+            "resourceManagementType": "CUSTOMER"
+        }
+    ],
+    "failures": []
+}

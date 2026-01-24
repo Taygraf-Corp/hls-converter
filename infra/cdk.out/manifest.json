@@ -23,7 +23,7 @@
         "validateOnSynth": false,
         "assumeRoleArn": "arn:${AWS::Partition}:iam::442956083883:role/cdk-hnb659fds-deploy-role-442956083883-ca-central-1",
         "cloudFormationExecutionRoleArn": "arn:${AWS::Partition}:iam::442956083883:role/cdk-hnb659fds-cfn-exec-role-442956083883-ca-central-1",
-        "stackTemplateAssetObjectUrl": "s3://cdk-hnb659fds-assets-442956083883-ca-central-1/7293e3559253e05ba5da39413ce529daba9d4ccc65d5bf403d4cc1b889d7277a.json",
+        "stackTemplateAssetObjectUrl": "s3://cdk-hnb659fds-assets-442956083883-ca-central-1/5f7edf7b1fb67e1c21426bd93bafab58a1657963073d66e3aea07c138c1245f0.json",
         "requiresBootstrapStackVersion": 6,
         "bootstrapStackVersionSsmParameter": "/cdk-bootstrap/hnb659fds/version",
         "additionalDependencies": [
@@ -56,12 +56,6 @@
                 "Value": "hls-converter"
               }
             ]
-          }
-        ],
-        "/HlsConverterStack/Repository/Resource": [
-          {
-            "type": "aws:cdk:logicalId",
-            "data": "Repository22E53BBD"
           }
         ],
         "/HlsConverterStack/SecurityGroup/Resource": [
@@ -152,7 +146,7 @@
               "new BaseService2 (/home/roppa/projects/hls-converter/infra/node_modules/aws-cdk-lib/aws-ecs/lib/base/base-service.js:1:12364)",
               "new FargateService2 (/home/roppa/projects/hls-converter/infra/node_modules/aws-cdk-lib/aws-ecs/lib/fargate/fargate-service.js:1:6371)",
               "new FargateService2 (/home/roppa/projects/hls-converter/infra/node_modules/aws-cdk-lib/core/lib/prop-injectable.js:1:681)",
-              "new HlsConverterStack (/home/roppa/projects/hls-converter/infra/lib/hls-converter-stack.ts:216:20)",
+              "new HlsConverterStack (/home/roppa/projects/hls-converter/infra/lib/hls-converter-stack.ts:211:20)",
               "Object.<anonymous> (/home/roppa/projects/hls-converter/infra/bin/app.ts:38:1)",
               "Module._compile (node:internal/modules/cjs/loader:1761:14)",
               "Module.m._compile (/home/roppa/.npm/_npx/1bf7c3c15bf47d04/node_modules/ts-node/src/index.ts:1618:23)",
