@@ -1,9 +1,15 @@
 import ffmpeg from 'fluent-ffmpeg';
+import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
+import ffprobeInstaller from '@ffprobe-installer/ffprobe';
 import { ConversionOptions, ConversionJob, Resolution, VideoMetadata, AspectRatio } from '../types/index.js';
 import { resolutionSets } from '../config/index.js';
 import { logger } from '../utils/logger.js';
 import fs from 'fs/promises';
 import path from 'path';
+
+// Set FFmpeg and FFprobe paths from installed binaries
+ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
 export class FFmpegService {
   /**

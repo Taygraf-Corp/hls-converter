@@ -12,6 +12,7 @@
     "server:prod": "node dist/server.js",
     "migrate": "tsx src/migrate.ts",
     "sync-hls-urls": "tsx scripts/sync-hls-urls.ts",
+    "generate-key": "tsx scripts/generate-api-key.ts",
     "test": "jest"
   },
   "keywords": [
@@ -25,6 +26,8 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@ffprobe-installer/ffprobe": "^2.1.2",
     "@supabase/supabase-js": "^2.39.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",

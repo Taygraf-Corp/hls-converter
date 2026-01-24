@@ -8,6 +8,7 @@ import { VideoFile, ConversionOptions } from './types/index.js';
 import { logger } from './utils/logger.js';
 import { ensureDir, cleanup, generateTempDir, getFilenameWithoutExtension } from './utils/file-utils.js';
 import { migrationConfig, resolutionSets } from './config/index.js';
+import { authenticate, isAuthEnabled } from './middleware/auth.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -250,7 +251,7 @@ app.get('/health', (req: Request, res: Response) => {
 /**
  * Upload and process video
  */
-app.post('/api/upload', upload.single('video'), async (req: Request, res: Response) => {
+app.post('/api/upload', authenticate, upload.single('video'), async (req: Request, res: Response) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -309,7 +310,7 @@ app.post('/api/upload', upload.single('video'), async (req: Request, res: Respon
 /**
  * Validate video without processing
  */
-app.post('/api/validate', upload.single('video'), async (req: Request, res: Response) => {
+app.post('/api/validate', authenticate, upload.single('video'), async (req: Request, res: Response) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -365,7 +366,7 @@ app.post('/api/validate', upload.single('video'), async (req: Request, res: Resp
 /**
  * Get video metadata from URL
  */
-app.post('/api/metadata', express.json(), async (req: Request, res: Response) => {
+app.post('/api/metadata', authenticate, express.json(), async (req: Request, res: Response) => {
   try {
     const { videoPath, bucket } = req.body;
 
@@ -418,7 +419,7 @@ app.post('/api/metadata', express.json(), async (req: Request, res: Response) =>
 /**
  * Process video from storage
  */
-app.post('/api/process-from-storage', express.json(), async (req: Request, res: Response) => {
+app.post('/api/process-from-storage', authenticate, express.json(), async (req: Request, res: Response) => {
   try {
     const { videoPath, bucket, userId, videoId } = req.body;
 
@@ -532,6 +533,12 @@ app.listen(PORT, () => {
   logger.info(`🚀 Video processing server running on port ${PORT}`);
   logger.info(`📁 Storage: ${migrationConfig.storage.targetBucket}/${migrationConfig.storage.targetFolder}`);
   logger.info(`🎬 FFmpeg ready for video processing`);
+  
+  if (isAuthEnabled()) {
+    logger.info(`🔐 API key authentication: ENABLED`);
+  } else {
+    logger.warn(`⚠️  API key authentication: DISABLED (set API_KEYS env variable to enable)`);
+  }
 });
 
 // Graceful shutdown

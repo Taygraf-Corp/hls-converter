@@ -1,0 +1,424 @@
+openapi: 3.0.3
+info:
+  title: HLS Video Conversion Service API
+  description: |
+    RESTful API for converting video files to HTTP Live Streaming (HLS) format with adaptive bitrate streaming.
+    
+    Features:
+    - Automatic aspect ratio detection (portrait, landscape, square)
+    - Smart resolution selection based on source dimensions
+    - Adaptive bitrate streaming with multiple quality variants
+    - H.264/AAC codec for universal compatibility
+    - Direct upload to Supabase Storage with public URLs
+  version: 1.0.0
+  contact:
+    name: API Support
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+  - url: https://your-production-url.com
+    description: Production server
+
+tags:
+  - name: health
+    description: Service health and status
+  - name: video
+    description: Video processing operations
+  - name: info
+    description: Service information
+
+paths:
+  /health:
+    get:
+      tags:
+        - health
+      summary: Health check
+      description: Check if the service is running and healthy
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  timestamp:
+                    type: string
+                    format: date-time
+                    example: '2026-01-24T16:23:58.145Z'
+
+  /api/info:
+    get:
+      tags:
+        - info
+      summary: Get service information
+      description: Get information about supported formats, resolution sets, and storage configuration
+      operationId: getInfo
+      responses:
+        '200':
+          description: Service information retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceInfo'
+
+  /api/upload:
+    post:
+      tags:
+        - video
+      summary: Upload and convert video to HLS
+      description: Upload a video file and convert it to HLS format with adaptive bitrate streaming
+      operationId: uploadVideo
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - video
+              properties:
+                video:
+                  type: string
+                  format: binary
+                  description: Video file to convert (max 500MB)
+                videoId:
+                  type: string
+                  description: Custom video ID (auto-generated if not provided)
+                  example: my-custom-video-id
+                userId:
+                  type: string
+                  description: User ID for tracking
+                  example: user-123
+                postId:
+                  type: string
+                  description: Post ID to update with HLS URL
+                  example: post-456
+      responses:
+        '200':
+          description: Video processed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VideoProcessResponse'
+        '400':
+          description: Bad request - missing or invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                noFile:
+                  value:
+                    success: false
+                    error: No video file provided
+        '500':
+          description: Internal server error - processing failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidVideo:
+                  value:
+                    success: false
+                    error: Invalid video file
+
+  /api/validate:
+    post:
+      tags:
+        - video
+      summary: Validate video file
+      description: Validate a video file without processing it
+      operationId: validateVideo
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - video
+              properties:
+                video:
+                  type: string
+                  format: binary
+                  description: Video file to validate
+      responses:
+        '200':
+          description: Video validated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationResponse'
+        '400':
+          description: Video is invalid
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  valid:
+                    type: boolean
+                    example: false
+                  error:
+                    type: string
+                    example: Invalid or corrupted video file
+        '500':
+          description: Validation failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/metadata:
+    post:
+      tags:
+        - video
+      summary: Get video metadata
+      description: Get metadata from a video file stored in Supabase Storage
+      operationId: getMetadata
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - videoPath
+              properties:
+                videoPath:
+                  type: string
+                  description: Path to video in storage bucket
+                  example: Videos/example.mp4
+                bucket:
+                  type: string
+                  description: Storage bucket name (defaults to source bucket)
+                  example: FlutterFlow
+      responses:
+        '200':
+          description: Metadata retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  metadata:
+                    $ref: '#/components/schemas/VideoMetadata'
+        '400':
+          description: Missing required parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missingPath:
+                  value:
+                    success: false
+                    error: videoPath is required
+        '500':
+          description: Failed to get metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/process-from-storage:
+    post:
+      tags:
+        - video
+      summary: Process video from storage
+      description: Process a video that's already stored in Supabase Storage
+      operationId: processFromStorage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - videoPath
+              properties:
+                videoPath:
+                  type: string
+                  description: Path to video in storage bucket
+                  example: Videos/my-video.mp4
+                bucket:
+                  type: string
+                  description: Storage bucket name (defaults to source bucket)
+                  example: FlutterFlow
+                videoId:
+                  type: string
+                  description: Custom video ID
+                  example: custom-id-123
+                userId:
+                  type: string
+                  description: User ID for tracking
+                  example: user-456
+      responses:
+        '200':
+          description: Video processed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VideoProcessResponse'
+        '400':
+          description: Missing required parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Processing failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    ServiceInfo:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        info:
+          type: object
+          properties:
+            supportedFormats:
+              type: array
+              items:
+                type: string
+              example: ["mp4", "mov", "avi", "webm", "mkv"]
+            maxFileSize:
+              type: string
+              example: "500MB"
+            resolutionSets:
+              type: object
+              properties:
+                portrait:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/Resolution'
+                landscape:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/Resolution'
+                square:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/Resolution'
+            storage:
+              type: object
+              properties:
+                bucket:
+                  type: string
+                  example: FlutterFlow
+                folder:
+                  type: string
+                  example: converted
+
+    Resolution:
+      type: object
+      properties:
+        width:
+          type: integer
+          example: 640
+        height:
+          type: integer
+          example: 360
+        bitrate:
+          type: integer
+          example: 400000
+
+    VideoMetadata:
+      type: object
+      properties:
+        width:
+          type: integer
+          example: 1920
+        height:
+          type: integer
+          example: 1080
+        duration:
+          type: number
+          format: float
+          example: 120.5
+        aspectRatio:
+          type: string
+          enum: [portrait, landscape, square]
+          example: landscape
+        bitrate:
+          type: integer
+          example: 5000000
+        resolutions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Resolution'
+
+    VideoProcessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        message:
+          type: string
+          example: Video processed successfully
+        data:
+          type: object
+          properties:
+            outputFiles:
+              type: array
+              items:
+                type: string
+              example:
+                - converted/my-video/hls/640p.m3u8
+                - converted/my-video/hls/640p_000.ts
+                - converted/my-video/hls/master.m3u8
+            metadata:
+              $ref: '#/components/schemas/VideoMetadata'
+            processingTime:
+              type: integer
+              description: Processing time in milliseconds
+              example: 2466
+            masterPlaylist:
+              type: string
+              description: Path to master playlist file
+              example: converted/my-video/hls/master.m3u8
+
+    ValidationResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        valid:
+          type: boolean
+          example: true
+        metadata:
+          $ref: '#/components/schemas/VideoMetadata'
+
+    ErrorResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: string
+          example: Error message describing what went wrong
