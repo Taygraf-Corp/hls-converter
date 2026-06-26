@@ -17,7 +17,7 @@ export class SupabaseStorageService {
     
     this.adminClient = createClient(
       migrationConfig.supabase.url,
-      migrationConfig.supabase.anonKey
+      process.env.SUPABASE_SERVICE_ROLE_KEY || migrationConfig.supabase.anonKey
     );
   }
 
