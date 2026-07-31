@@ -30,8 +30,17 @@ export class FFmpegService {
           return;
         }
 
-        const width = videoStream.width;
-        const height = videoStream.height;
+        let width = videoStream.width;
+        let height = videoStream.height;
+
+        // Prefer display orientation (rotation tag / side data) over coded size.
+        const rotation = this.getRotationDegrees(videoStream);
+        if (rotation === 90 || rotation === 270) {
+          const tmp = width;
+          width = height;
+          height = tmp;
+        }
+
         const duration = typeof metadata.format.duration === 'number' 
           ? metadata.format.duration 
           : parseFloat(metadata.format.duration || '0');
@@ -55,21 +64,60 @@ export class FFmpegService {
   /**
    * Detect aspect ratio category based on video dimensions
    */
+  /**
+   * Read rotation degrees from stream tags or side_data when present.
+   */
+  private getRotationDegrees(videoStream: any): number {
+    const tagRotation = videoStream?.tags?.rotate ?? videoStream?.tags?.rotation;
+    if (tagRotation != null && tagRotation !== '') {
+      const parsed = parseInt(String(tagRotation), 10);
+      if (!Number.isNaN(parsed)) {
+        return ((parsed % 360) + 360) % 360;
+      }
+    }
+
+    const sideData = videoStream?.side_data_list;
+    if (Array.isArray(sideData)) {
+      for (const entry of sideData) {
+        if (entry?.rotation != null) {
+          const parsed = parseInt(String(entry.rotation), 10);
+          if (!Number.isNaN(parsed)) {
+            return ((parsed % 360) + 360) % 360;
+          }
+        }
+      }
+    }
+
+    return 0;
+  }
+
   private detectAspectRatio(width: number, height: number): AspectRatio {
     const ratio = width / height;
-    
-    // Define thresholds for aspect ratio detection
-    const PORTRAIT_THRESHOLD = 0.75;  // 3:4 and narrower (including 9:16)
-    const SQUARE_THRESHOLD_LOW = 0.9; // Close to square
-    const SQUARE_THRESHOLD_HIGH = 1.1; // Close to square
-    
-    if (ratio < PORTRAIT_THRESHOLD) {
+
+    // Treat anything taller than wide (incl. 4:5 = 0.8) as portrait.
+    // Previous PORTRAIT_THRESHOLD of 0.75 mis-labeled 4:5 as landscape, which
+    // force-scaled portrait uploads into 16:9 HLS and stretched playback.
+    const SQUARE_THRESHOLD_LOW = 0.9;
+    const SQUARE_THRESHOLD_HIGH = 1.1;
+
+    if (ratio < SQUARE_THRESHOLD_LOW) {
       return 'portrait';
-    } else if (ratio >= SQUARE_THRESHOLD_LOW && ratio <= SQUARE_THRESHOLD_HIGH) {
+    } else if (ratio <= SQUARE_THRESHOLD_HIGH) {
       return 'square';
     } else {
       return 'landscape';
     }
+  }
+
+  /**
+   * Scale into target size without anamorphic stretch (letterbox/pillarbox).
+   */
+  private scalePadFilter(resolution: Resolution): string {
+    const { width, height } = resolution;
+    return (
+      `scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
+      `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`
+    );
   }
 
   /**
@@ -256,7 +304,7 @@ export class FFmpegService {
         command.outputOptions([
           `-c:v:${index}`, 'libx264',
           `-b:v:${index}`, resolution.bitrate.toString(),
-          `-s:v:${index}`, `${resolution.width}x${resolution.height}`,
+          `-filter:v:${index}`, this.scalePadFilter(resolution),
           `-profile:v:${index}`, 'main',
           `-level:v:${index}`, '3.1'
         ]);
@@ -329,7 +377,7 @@ export class FFmpegService {
           '-seg_duration', options.cmafFragmentDuration.toString(),
           '-c:v', 'libx264',
           '-b:v', targetResolution.bitrate.toString(),
-          '-s', `${targetResolution.width}x${targetResolution.height}`,
+          '-vf', this.scalePadFilter(targetResolution),
           '-profile:v', 'main',
           '-level', '3.1',
           '-preset', 'fast',
@@ -382,7 +430,7 @@ export class FFmpegService {
           '-c:a', 'aac',
           '-b:v', resolution.bitrate.toString(),
           '-b:a', options.audioBitrate.toString(),
-          '-s', `${resolution.width}x${resolution.height}`,
+          '-vf', this.scalePadFilter(resolution),
           '-profile:v', 'main',
           '-level', '3.1',
           '-preset', 'medium',
