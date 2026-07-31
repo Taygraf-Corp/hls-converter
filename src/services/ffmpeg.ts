@@ -110,13 +110,14 @@ export class FFmpegService {
   }
 
   /**
-   * Scale into target size without anamorphic stretch (letterbox/pillarbox).
+   * Fill target size without anamorphic stretch (center-crop).
+   * Prefer crop over pad so portrait feeds don't show black bars.
    */
-  private scalePadFilter(resolution: Resolution): string {
+  private scaleCropFilter(resolution: Resolution): string {
     const { width, height } = resolution;
     return (
-      `scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
-      `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`
+      `scale=${width}:${height}:force_original_aspect_ratio=increase,` +
+      `crop=${width}:${height},setsar=1`
     );
   }
 
@@ -304,7 +305,7 @@ export class FFmpegService {
         command.outputOptions([
           `-c:v:${index}`, 'libx264',
           `-b:v:${index}`, resolution.bitrate.toString(),
-          `-filter:v:${index}`, this.scalePadFilter(resolution),
+          `-filter:v:${index}`, this.scaleCropFilter(resolution),
           `-profile:v:${index}`, 'main',
           `-level:v:${index}`, '3.1'
         ]);
@@ -377,7 +378,7 @@ export class FFmpegService {
           '-seg_duration', options.cmafFragmentDuration.toString(),
           '-c:v', 'libx264',
           '-b:v', targetResolution.bitrate.toString(),
-          '-vf', this.scalePadFilter(targetResolution),
+          '-vf', this.scaleCropFilter(targetResolution),
           '-profile:v', 'main',
           '-level', '3.1',
           '-preset', 'fast',
@@ -430,7 +431,7 @@ export class FFmpegService {
           '-c:a', 'aac',
           '-b:v', resolution.bitrate.toString(),
           '-b:a', options.audioBitrate.toString(),
-          '-vf', this.scalePadFilter(resolution),
+          '-vf', this.scaleCropFilter(resolution),
           '-profile:v', 'main',
           '-level', '3.1',
           '-preset', 'medium',
