@@ -1,0 +1,47 @@
+name: CI
+
+# Pull-request safety gate for the HLS converter service.
+#
+# Validates that both the service (src/) and the AWS CDK infra (infra/) typecheck
+# cleanly before a change can be merged. This does NOT build a Docker image, deploy,
+# or touch AWS in any way — it is a static gate only. Production deployment remains
+# governed entirely by the existing deploy.yml workflow (unchanged).
+#
+# No unit tests exist in this repository yet; adding a test framework is intentionally
+# out of scope for this change, so no test step is run here.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck:
+    name: Typecheck (src + infra)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies (service)
+        run: npm ci
+
+      - name: Typecheck service (tsc --noEmit)
+        run: npx tsc --noEmit
+
+      - name: Install dependencies (infra / CDK)
+        run: npm ci
+        working-directory: infra
+
+      - name: Typecheck infra (tsc --noEmit)
+        run: npx tsc --noEmit
+        working-directory: infra
