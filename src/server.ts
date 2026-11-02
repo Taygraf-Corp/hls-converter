@@ -9,6 +9,14 @@ import { logger } from './utils/logger.js';
 import { ensureDir, cleanup, generateTempDir, getFilenameWithoutExtension } from './utils/file-utils.js';
 import { migrationConfig, resolutionSets } from './config/index.js';
 import { authenticate, isAuthEnabled } from './middleware/auth.js';
+import {
+  PUBLIC_SOURCE_BUCKET,
+  PostRow,
+  conversionRefusal,
+  hlsFolderFor,
+  isUuid,
+  revokeRequired,
+} from './services/hls-policy.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -50,7 +58,6 @@ const upload = multer({
 // Services
 const ffmpegService = new FFmpegService();
 const storageService = new SupabaseStorageService();
-const supabase = new SupabaseStorageService();
 
 /**
  * Process video and convert to HLS
@@ -58,12 +65,7 @@ const supabase = new SupabaseStorageService();
 async function processVideo(
   inputPath: string,
   filename: string,
-  options?: {
-    userId?: string;
-    videoId?: string;
-    customPath?: string;
-    postId?: string;
-  }
+  storagePath: string
 ): Promise<{
   success: boolean;
   outputFiles?: string[];
@@ -122,40 +124,12 @@ async function processVideo(
       }
     );
 
-    // Determine storage path
-    const storagePath = options?.customPath || buildStoragePath(
-      baseFilename,
-      options?.videoId
-    );
-
     // Upload to Supabase Storage
     logger.info(`Uploading to storage: ${storagePath}`);
     const uploadedFiles = await storageService.uploadHlsFiles(
       outputDir,
       storagePath
     );
-
-    // Update post with HLS URL if postId provided
-    const postId = options?.postId;
-    if (postId) {
-      try {
-        // Construct full public HLS URL
-        const baseStorageUrl = process.env.PUBLIC_STORAGE_BASE_URL || 
-          'https://ohfzckfunpsjncjjzfyz.supabase.co/storage/v1/object/public/FlutterFlow/';
-        const masterPlaylistPath = uploadedFiles.find(f => f.endsWith('master.m3u8'));
-        
-        if (masterPlaylistPath) {
-          const hlsUrl = `${baseStorageUrl}${masterPlaylistPath}`;
-          logger.info(`Updating post ${postId} with HLS URL: ${hlsUrl}`);
-          
-          await supabase.updatePost(postId, {
-            hls_url: hlsUrl
-          });
-        }
-      } catch (error) {
-        logger.error(`Error updating post ${postId}:`, error);
-      }
-    }
 
     const processingTime = Date.now() - startTime;
 
@@ -201,98 +175,27 @@ async function processVideo(
   }
 }
 
-/** Public source bucket: legacy Standard posts and multi-account uploads. */
-const PUBLIC_SOURCE_BUCKET = 'FlutterFlow';
-/** Private bucket of the unified composer (taygram #101). */
-const PRIVATE_SOURCE_BUCKET = 'unfiltered';
+const PUBLIC_STORAGE_BASE_URL = process.env.PUBLIC_STORAGE_BASE_URL ||
+  'https://ohfzckfunpsjncjjzfyz.supabase.co/storage/v1/object/public/FlutterFlow/';
 
 /**
- * Decide whether a source object may be converted. HLS output always lands in
- * the public bucket, so a private object may only be converted onto the post
- * whose own single-item media it is (General Feed, Unfiltered or both: product
- * decision 2026-11-02, the HLS copy is public by link). Carousels are refused:
- * posts.hls_url can only describe one item.
- * Returns a refusal reason, or null when the request is allowed.
+ * Routes the app does not use (manual upload, validate, metadata, the test
+ * page) stay off unless ENABLE_ADMIN_ROUTES=true: /api/upload used to write
+ * hls_url onto any caller-named post (CTO review 2026-11-02, finding 1).
  */
-async function checkSourceAllowed(
-  bucket: string,
-  videoPath: string,
-  postId?: string,
-  videoId?: string
-): Promise<string | null> {
-  if (bucket === PUBLIC_SOURCE_BUCKET) {
-    // A public file may be converted, but it may only be written onto the post
-    // whose own video it is.
-    if (!postId) {
-      return null;
-    }
-    const post = await storageService.getPostMedia(postId);
-    if (!post) {
-      return 'post not found';
-    }
-    if (!sameObject(post.video_url, bucket, videoPath)) {
-      return 'videoPath is not this post\'s video';
-    }
-    return null;
+const adminRoutesEnabled = process.env.ENABLE_ADMIN_ROUTES === 'true';
+function adminOnly(_req: Request, res: Response, next: NextFunction): void {
+  if (!adminRoutesEnabled) {
+    res.status(404).json({ success: false, error: 'Route not found' });
+    return;
   }
-  if (bucket !== PRIVATE_SOURCE_BUCKET) {
-    return `bucket ${bucket} is not a conversion source`;
-  }
-  if (!postId || (videoId && videoId !== postId)) {
-    return 'private media needs a postId, and videoId must equal it';
-  }
-  const post = await storageService.getPostMedia(postId);
-  if (!post) {
-    return 'post not found';
-  }
-  if (post.media_bucket !== bucket || post.media_path !== videoPath) {
-    return 'videoPath is not this post\'s media';
-  }
-  if ((post.media_count ?? 1) !== 1) {
-    return 'carousel posts are not converted';
-  }
-  return null;
+  next();
 }
 
-/** Whether a public object URL names bucket/objectPath (URL-encoding ignored). */
-function sameObject(url: string | null, bucket: string, objectPath: string): boolean {
-  if (!url) {
-    return false;
-  }
-  try {
-    const pathname = decodeURIComponent(new URL(url).pathname);
-    return pathname.endsWith(`/storage/v1/object/public/${bucket}/${objectPath}`);
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Build storage path
- * Structure: converted/{filename}/hls
- */
-function buildStoragePath(
-  filename: string,
-  videoId?: string
-): string {
-  const parts = [migrationConfig.storage.targetFolder];
-
-  // Use videoId if provided, otherwise sanitize filename
-  const id = videoId || sanitizeFilename(filename);
-  parts.push(id, 'hls');
-
-  return parts.join('/');
-}
-
-/**
- * Sanitize filename
- */
-function sanitizeFilename(filename: string): string {
-  return filename
-    .replace(/\.[^/.]+$/, '')
-    .replace(/[^a-zA-Z0-9-_]/g, '-')
-    .replace(/-+/g, '-')
-    .toLowerCase();
+async function loadPolicyInputs(postId: string): Promise<{ post: PostRow | null; deletionPending: boolean }> {
+  const post = await storageService.getPostForHls(postId);
+  const deletionPending = post ? await storageService.hasDeletionJob(post.profile_id) : false;
+  return { post, deletionPending };
 }
 
 // Routes
@@ -300,7 +203,7 @@ function sanitizeFilename(filename: string): string {
 /**
  * Home page - Upload test interface
  */
-app.get('/', (req: Request, res: Response) => {
+app.get('/', adminOnly, (req: Request, res: Response) => {
   res.sendFile(path.join(process.cwd(), 'examples', 'upload-test.html'));
 });
 
@@ -317,7 +220,7 @@ app.get('/health', (req: Request, res: Response) => {
 /**
  * Upload and process video
  */
-app.post('/api/upload', authenticate, upload.single('video'), async (req: Request, res: Response) => {
+app.post('/api/upload', adminOnly, authenticate, upload.single('video'), async (req: Request, res: Response) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -328,13 +231,11 @@ app.post('/api/upload', authenticate, upload.single('video'), async (req: Reques
 
     logger.info(`Received upload: ${req.file.originalname} (${(req.file.size / 1024 / 1024).toFixed(2)} MB)`);
 
-    const { userId, videoId, postId } = req.body;
-
-    // Process the video
+    // Admin-only test path: never bound to a post, never a caller-chosen folder.
     const result = await processVideo(
       req.file.path,
       req.file.originalname,
-      { userId, videoId, postId }
+      `${migrationConfig.storage.targetFolder}/manual-${Date.now()}-${Math.round(Math.random() * 1e9)}/hls`
     );
 
     // Cleanup uploaded file
@@ -376,7 +277,7 @@ app.post('/api/upload', authenticate, upload.single('video'), async (req: Reques
 /**
  * Validate video without processing
  */
-app.post('/api/validate', authenticate, upload.single('video'), async (req: Request, res: Response) => {
+app.post('/api/validate', adminOnly, authenticate, upload.single('video'), async (req: Request, res: Response) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -432,7 +333,7 @@ app.post('/api/validate', authenticate, upload.single('video'), async (req: Requ
 /**
  * Get video metadata from URL
  */
-app.post('/api/metadata', authenticate, express.json(), async (req: Request, res: Response) => {
+app.post('/api/metadata', adminOnly, authenticate, express.json(), async (req: Request, res: Response) => {
   try {
     const { videoPath, bucket } = req.body;
 
@@ -483,70 +384,133 @@ app.post('/api/metadata', authenticate, express.json(), async (req: Request, res
 });
 
 /**
- * Process video from storage
+ * Convert one post's own video to HLS and set its hls_url.
+ *
+ * Body: { postId, videoPath, bucket?, videoId? }. postId is required; the
+ * output folder is always converted/<postId>/hls, derived here, never taken
+ * from the caller (CTO review finding 2). The post row decides whether the
+ * source may be converted (hls-policy.ts); hls_url is set in one UPDATE that
+ * rechecks eligibility, and on any refusal the uploaded files are removed.
+ * 200 only when hls_url was written; 403 refused up front; 409 the post
+ * changed during conversion; 500 failure (nothing left published).
  */
 app.post('/api/process-from-storage', authenticate, express.json(), async (req: Request, res: Response) => {
+  const { videoPath, bucket, videoId, postId } = req.body ?? {};
+  if (typeof videoPath !== 'string' || !videoPath || videoPath.includes('..')) {
+    return res.status(400).json({ success: false, error: 'videoPath is required' });
+  }
+  if (!isUuid(postId)) {
+    return res.status(400).json({ success: false, error: 'postId (a UUID) is required' });
+  }
+  if (videoId !== undefined && videoId !== null && String(videoId).toLowerCase() !== postId.toLowerCase()) {
+    return res.status(400).json({ success: false, error: 'videoId, when given, must equal postId' });
+  }
+  const sourceBucket: string = typeof bucket === 'string' && bucket ? bucket : PUBLIC_SOURCE_BUCKET;
+  const folder = hlsFolderFor(postId, migrationConfig.storage.targetFolder);
+
+  let tempDir: string | null = null;
+  let uploaded: string[] = [];
   try {
-    const { videoPath, bucket, userId, videoId, postId } = req.body;
-
-    if (!videoPath) {
-      return res.status(400).json({
-        success: false,
-        error: 'videoPath is required'
-      });
-    }
-
-    const videoFile: VideoFile = {
-      name: path.basename(videoPath),
-      path: videoPath,
-      size: 0,
-      bucket: bucket || migrationConfig.storage.sourceBucket
-    };
-
-    const refusal = await checkSourceAllowed(videoFile.bucket, videoPath, postId, videoId);
-    if (refusal) {
-      logger.warn(`Refused process-from-storage for ${videoFile.bucket}/${videoPath}: ${refusal}`);
+    const before = await loadPolicyInputs(postId);
+    const refusal = conversionRefusal(before.post, sourceBucket, videoPath, before.deletionPending);
+    if (refusal || !before.post) {
+      logger.warn(`Refused process-from-storage: ${refusal}`);
       return res.status(403).json({ success: false, error: refusal });
     }
-
-    logger.info(`Processing from storage: ${videoPath}`);
-
-    // Download video
-    const tempDir = generateTempDir(migrationConfig.processing.tempDir, 'storage-process');
-    await ensureDir(tempDir);
-    const tempPath = path.join(tempDir, videoFile.name);
-
-    await storageService.downloadFile(videoFile, tempPath);
-
-    // Process the video
-    const result = await processVideo(tempPath, videoFile.name, { userId, videoId, postId });
-
-    // Cleanup
-    await cleanup([tempDir]);
-
-    if (!result.success) {
-      return res.status(500).json({
-        success: false,
-        error: result.error
-      });
+    const post = before.post;
+    if (await storageService.otherPostUsesFolder(postId, folder)) {
+      logger.warn('Refused process-from-storage: another post plays from this folder');
+      return res.status(409).json({ success: false, error: 'another post plays HLS from this folder' });
     }
 
-    res.json({
+    const videoFile: VideoFile = { name: path.basename(videoPath), path: videoPath, size: 0, bucket: sourceBucket };
+    logger.info('Processing from storage');
+    tempDir = generateTempDir(migrationConfig.processing.tempDir, 'storage-process');
+    await ensureDir(tempDir);
+    const tempPath = path.join(tempDir, videoFile.name);
+    await storageService.downloadFile(videoFile, tempPath);
+
+    const result = await processVideo(tempPath, videoFile.name, folder);
+    uploaded = result.outputFiles ?? [];
+    if (!result.success) {
+      throw new Error(result.error || 'conversion failed');
+    }
+    const master = uploaded.find(f => f.endsWith('master.m3u8'));
+    if (!master) {
+      throw new Error('no master playlist was produced');
+    }
+
+    // Publication-time recheck: the row must still be eligible and name the
+    // same source, in the same UPDATE that publishes the URL.
+    const published = await storageService.setHlsUrlIfStillEligible(post, `${PUBLIC_STORAGE_BASE_URL}${master}`);
+    if (!published) {
+      await storageService.removeFolder(folder);
+      uploaded = [];
+      logger.warn('Post changed during conversion; HLS removed');
+      return res.status(409).json({ success: false, error: 'post is no longer eligible; nothing published' });
+    }
+
+    logger.info('Successfully set hls_url');
+    return res.json({
       success: true,
       message: 'Video processed successfully',
       data: {
-        outputFiles: result.outputFiles,
+        outputFiles: uploaded,
         metadata: result.metadata,
         processingTime: result.processingTime,
-        masterPlaylist: result.outputFiles?.find(f => f.endsWith('master.m3u8'))
+        masterPlaylist: master
       }
     });
-
   } catch (error) {
     logger.error('Process from storage error:', error);
-    res.status(500).json({
+    if (uploaded.length > 0) {
+      // Never leave a public copy that no row points at.
+      await storageService.removeFolder(folder).catch(err =>
+        logger.error('Failed to remove HLS after an error:', err));
+    }
+    return res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Processing failed'
+    });
+  } finally {
+    if (tempDir) {
+      await cleanup([tempDir]).catch(() => {});
+    }
+  }
+});
+
+/**
+ * Remove a post's public HLS when it must no longer exist: the post was
+ * deleted, hidden, made VIP, expired, its media changed, or its author is being
+ * deleted (CTO review finding 3). A post that is still eligible keeps its HLS
+ * (409), so the app's key cannot be used to strip anyone's video.
+ * Body: { postId }.
+ */
+app.post('/api/revoke-hls', authenticate, express.json(), async (req: Request, res: Response) => {
+  const { postId } = req.body ?? {};
+  if (!isUuid(postId)) {
+    return res.status(400).json({ success: false, error: 'postId (a UUID) is required' });
+  }
+  try {
+    const { post, deletionPending } = await loadPolicyInputs(postId);
+    if (!revokeRequired(post, deletionPending)) {
+      return res.status(409).json({ success: false, error: 'post is still eligible; HLS kept' });
+    }
+    const folder = hlsFolderFor(postId, migrationConfig.storage.targetFolder);
+    if (await storageService.otherPostUsesFolder(postId, folder)) {
+      return res.status(409).json({ success: false, error: 'another post plays HLS from this folder; kept' });
+    }
+    const removed = await storageService.removeFolder(folder);
+    if (post) {
+      await storageService.clearHlsUrl(postId, folder);
+    }
+    logger.info(`Revoked HLS: ${removed} object(s) removed`);
+    return res.json({ success: true, removed });
+  } catch (error) {
+    logger.error('Revoke HLS error:', error);
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Revoke failed'
     });
   }
 });

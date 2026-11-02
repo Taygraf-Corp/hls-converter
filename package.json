@@ -14,10 +14,10 @@
     "sync-hls-urls": "tsx scripts/sync-hls-urls.ts",
     "batch-convert": "tsx scripts/batch-convert-posts.ts",
     "generate-key": "tsx scripts/generate-api-key.ts",
-    "test": "jest",
+    "test": "node --import tsx --test --test-concurrency=1 tests/*.test.ts",
     "deploy": "./scripts/deploy.sh",
     "deploy:infra": "./scripts/deploy.sh --infra-only",
-    "deploy:image": "./scripts/deploy.sh --image-only",
+    "deploy:image": "./scripts/deploy-image-pinned.sh",
     "cdk:synth": "cd infra && npx cdk synth",
     "cdk:diff": "cd infra && npx cdk diff",
     "cdk:destroy": "cd infra && npx cdk destroy"

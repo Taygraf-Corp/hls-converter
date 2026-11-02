@@ -2,6 +2,7 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { migrationConfig } from '../config/index.js';
 import { VideoFile, StorageFile } from '../types/index.js';
 import { logger } from '../utils/logger.js';
+import { POST_COLUMNS, PostRow } from './hls-policy.js';
 import fs from 'fs/promises';
 import path from 'path';
 
@@ -27,39 +28,127 @@ export class SupabaseStorageService {
     );
   }
 
-  /**
-   * Read the media fields of one post (service role). Null when no row matches.
-   */
-  async getPostMedia(postId: string): Promise<{
-    media_bucket: string | null;
-    media_path: string | null;
-    media_count: number | null;
-    video_url: string | null;
-  } | null> {
+  /** One post row for the HLS policy (service role). Null when no row matches. */
+  async getPostForHls(postId: string): Promise<PostRow | null> {
     const { data, error } = await this.adminClient
       .from('posts')
-      .select('media_bucket, media_path, media_count, video_url')
+      .select(POST_COLUMNS)
       .eq('id', postId)
       .maybeSingle();
 
     if (error) {
-      throw new Error(`Failed to read post ${postId}: ${error.message}`);
+      throw new Error(`Failed to read post: ${error.message}`);
     }
-    return data;
+    return (data as PostRow | null) ?? null;
   }
 
-  async updatePost(postId: string, data: any): Promise<void> {
-    const { data: result, error } = await this.adminClient
-      .from('posts')
-      .update(data)
-      .eq('id', postId)
-      .select();
-    
-    if (error) {
-      throw new Error(`Failed to update post ${postId}: ${error.message}`);
+  /** Whether the author has an account-deletion job of any status. */
+  async hasDeletionJob(profileId: string | null): Promise<boolean> {
+    if (!profileId) {
+      return false;
     }
-    
-    logger.info(`Successfully updated post ${postId} with data:`, data);
+    const { data, error } = await this.adminClient
+      .from('account_deletion_jobs')
+      .select('id')
+      .eq('profile_id', profileId)
+      .limit(1);
+
+    if (error) {
+      // Unknown must not read as "no deletion": refuse instead.
+      throw new Error(`Failed to read account deletion state: ${error.message}`);
+    }
+    return (data ?? []).length > 0;
+  }
+
+  /**
+   * Set hls_url only if the row still names the same source and is still
+   * eligible at this moment (publication-time recheck, one UPDATE). Returns
+   * whether a row was updated.
+   */
+  async setHlsUrlIfStillEligible(post: PostRow, hlsUrl: string): Promise<boolean> {
+    let q = this.adminClient
+      .from('posts')
+      .update({ hls_url: hlsUrl })
+      .eq('id', post.id)
+      .or('is_hidden.is.null,is_hidden.eq.false')
+      .or('is_vip.is.null,is_vip.eq.false');
+
+    if (post.media_path) {
+      q = q
+        .eq('media_bucket', post.media_bucket as string)
+        .eq('media_path', post.media_path)
+        .is('expires_at', null);
+    } else {
+      q = q.is('media_path', null).eq('video_url', post.video_url as string);
+      q = post.expires_at
+        ? q.gt('expires_at', new Date().toISOString())
+        : q.is('expires_at', null);
+    }
+
+    const { data, error } = await q.select('id');
+    if (error) {
+      throw new Error(`Failed to set hls_url: ${error.message}`);
+    }
+    return (data ?? []).length === 1;
+  }
+
+  /** Clear hls_url when it still points at this post's own folder. */
+  async clearHlsUrl(postId: string, folder: string): Promise<void> {
+    const { error } = await this.adminClient
+      .from('posts')
+      .update({ hls_url: null })
+      .eq('id', postId)
+      .like('hls_url', `%/${folder}/%`);
+    if (error) {
+      throw new Error(`Failed to clear hls_url: ${error.message}`);
+    }
+  }
+
+  /**
+   * Whether a post other than [postId] plays HLS from [folder]. Older batch
+   * migrations named folders after source files, so a folder name alone does
+   * not prove which post owns it.
+   */
+  async otherPostUsesFolder(postId: string, folder: string): Promise<boolean> {
+    const { data, error } = await this.adminClient
+      .from('posts')
+      .select('id')
+      .neq('id', postId)
+      .like('hls_url', `%/${folder}/%`)
+      .limit(1);
+    if (error) {
+      throw new Error(`Failed to check folder use: ${error.message}`);
+    }
+    return (data ?? []).length > 0;
+  }
+
+  /** Remove every object directly inside [folder] of the target bucket. */
+  async removeFolder(folder: string, bucket?: string): Promise<number> {
+    const targetBucket = bucket || migrationConfig.storage.targetBucket;
+    let removed = 0;
+    let rounds = 0;
+    for (;;) {
+      const { data, error } = await this.adminClient.storage
+        .from(targetBucket)
+        .list(folder, { limit: 1000 });
+      if (error) {
+        throw new Error(`Failed to list ${folder}: ${error.message}`);
+      }
+      const files = (data ?? []).filter(f => f.id).map(f => `${folder}/${f.name}`);
+      if (++rounds > 50) {
+        throw new Error(`Gave up removing ${folder}: objects keep reappearing`);
+      }
+      if (files.length === 0) {
+        return removed;
+      }
+      const { error: rmError } = await this.adminClient.storage
+        .from(targetBucket)
+        .remove(files);
+      if (rmError) {
+        throw new Error(`Failed to remove from ${folder}: ${rmError.message}`);
+      }
+      removed += files.length;
+    }
   }
 
   /**
