@@ -1,7 +1,14 @@
 /**
- * End-to-end tests of the conversion and revoke routes against an in-memory
- * stand-in for Supabase (PostgREST + Storage) and the real bundled ffmpeg.
- * No network and no real project: SUPABASE_URL points at the stand-in.
+ * End-to-end tests of the conversion, revoke and reconcile paths against an
+ * in-memory stand-in for Supabase (PostgREST, Storage, the reconcile-queue
+ * RPCs) and the real bundled ffmpeg. No network and no real project:
+ * SUPABASE_URL points at the stand-in. The stand-in can inject faults: failed
+ * uploads, failed or committed-then-failed UPDATEs, failed reads, a queue
+ * that is down, and row changes in the middle of a conversion.
+ *
+ * Database triggers are not modelled here; taygram-backend's harness tests
+ * those (supabase/proposals/hls-unified/queue_test.sql). Tests put queue
+ * entries in directly.
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,14 +24,29 @@ type Row = Record<string, any>;
 const KEY = 'test-key';
 const BASE = 'https://ref.supabase.co/storage/v1/object/public/FlutterFlow/';
 const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+const HOUR = 3_600_000;
 
 const posts = new Map<string, Row>();
 const deletionJobs: Row[] = [];
-const objects = new Map<string, Buffer>(); // "<bucket>/<path>"
-const hooks = {
-  onUpload: new Map<string, () => void>(), // post id -> run on its first HLS upload
-  failPatch: new Set<string>(),
+const objects = new Map<string, { data: Buffer; modifiedAt: number }>(); // "<bucket>/<path>"
+const queue = new Map<string, { post_id: string; queued_at: string; attempts: number; next: number; last_error?: string }>();
+const faults = {
+  /** post id -> run once on that post's Nth HLS upload (1-based) */
+  onUpload: new Map<string, { n: number; run: () => void; seen?: number }>(),
+  /** post id -> fail the Nth HLS upload with a 500 */
+  failUpload: new Map<string, number>(),
+  /**
+   * post id -> 'error' (500, nothing written) | 'commit-then-error' (written,
+   * then 500) | 'commit-then-unreadable' (written, 500, and reads fail after)
+   */
+  patch: new Map<string, 'error' | 'commit-then-error' | 'commit-then-unreadable'>(),
+  /** post ids whose reads fail */
+  failRead: new Set<string>(),
+  /** fail storage removals under this prefix */
+  failRemove: new Set<string>(),
+  queueDown: false,
 };
+const sent: { patches: string[] } = { patches: [] };
 
 function privPost(n: number, over: Row = {}): Row {
   return {
@@ -35,18 +57,20 @@ function privPost(n: number, over: Row = {}): Row {
   };
 }
 
-/** Minimal PostgREST filter evaluation for the filters the service sends. */
+/** PostgREST filter evaluation for the filters the service sends. */
 function matches(row: Row, params: URLSearchParams): boolean {
   const one = (col: string, expr: string): boolean => {
     const dot = expr.indexOf('.');
     const op = expr.slice(0, dot);
     const v = expr.slice(dot + 1);
     const cell = row[col];
+    const present = cell !== null && cell !== undefined;
     switch (op) {
-      case 'eq': return cell !== null && cell !== undefined && String(cell) === v;
-      case 'neq': return cell === null || cell === undefined || String(cell) !== v;
-      case 'is': return v === 'null' ? cell === null || cell === undefined : String(cell) === v;
-      case 'gt': return cell !== null && cell !== undefined && String(cell) > v;
+      case 'eq': return present && String(cell) === v;
+      case 'neq': return !present || String(cell) !== v;
+      case 'is': return v === 'null' ? !present : String(cell) === v;
+      case 'gt': return present && Date.parse(String(cell)) > Date.parse(v);
+      case 'in': return present && v.replace(/^\(|\)$/g, '').split(',').map(x => x.replace(/^"|"$/g, '')).includes(String(cell));
       case 'like': {
         const re = new RegExp('^' + v.split('%').map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
         return typeof cell === 'string' && re.test(cell);
@@ -66,7 +90,7 @@ function matches(row: Row, params: URLSearchParams): boolean {
   return true;
 }
 
-function body(req: http.IncomingMessage): Promise<Buffer> {
+function readBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise(resolve => {
     const chunks: Buffer[] = [];
     req.on('data', c => chunks.push(c));
@@ -81,55 +105,114 @@ const mock = http.createServer(async (req, res) => {
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify(data));
   };
-  const raw = await body(req);
+  const raw = await readBody(req);
+  const pid = (u.searchParams.get('id') ?? '').replace('eq.', '');
 
   if (u.pathname === '/rest/v1/posts') {
+    if (faults.failRead.has(pid) && req.method === 'GET') return send(500, { message: 'simulated read failure' });
     const rows = [...posts.values()].filter(r => matches(r, u.searchParams));
     if (req.method === 'GET') return send(200, rows);
     if (req.method === 'PATCH') {
-      const pid = (u.searchParams.get('id') ?? '').replace('eq.', '');
-      if (hooks.failPatch.has(pid)) return send(500, { message: 'simulated database failure' });
+      sent.patches.push(pid);
+      const mode = faults.patch.get(pid);
+      if (mode === 'error') return send(500, { message: 'simulated database failure' });
       const patch = JSON.parse(raw.toString());
       rows.forEach(r => Object.assign(r, patch));
+      if (mode === 'commit-then-unreadable') faults.failRead.add(pid);
+      if (mode === 'commit-then-error' || mode === 'commit-then-unreadable') {
+        return send(500, { message: 'simulated failure after commit' });
+      }
       return send(200, rows.map(r => ({ id: r.id })));
     }
   }
   if (u.pathname === '/rest/v1/account_deletion_jobs') {
-    const pid = (u.searchParams.get('profile_id') ?? '').replace('eq.', '');
-    return send(200, deletionJobs.filter(j => j.profile_id === pid).map(j => ({ id: j.id })));
+    const profile = (u.searchParams.get('profile_id') ?? '').replace('eq.', '');
+    return send(200, deletionJobs.filter(j => j.profile_id === profile).map(j => ({ id: j.id })));
+  }
+  if (u.pathname.startsWith('/rest/v1/rpc/')) {
+    if (faults.queueDown) return send(503, { message: 'simulated queue outage' });
+    const args = raw.length ? JSON.parse(raw.toString()) : {};
+    switch (u.pathname.slice('/rest/v1/rpc/'.length)) {
+      case 'hls_claim_reconcile': {
+        const now = Date.now();
+        const due = [...queue.values()].filter(q => q.next <= now).slice(0, args.p_limit);
+        due.forEach(q => { q.attempts++; q.next = now + 100; });
+        return send(200, due.map(q => ({ post_id: q.post_id, queued_at: q.queued_at, attempts: q.attempts })));
+      }
+      case 'hls_complete_reconcile': {
+        const q = queue.get(args.p_post_id);
+        const ok = !!q && q.queued_at === args.p_queued_at;
+        if (ok) queue.delete(args.p_post_id);
+        return send(200, ok);
+      }
+      case 'hls_fail_reconcile': {
+        const q = queue.get(args.p_post_id);
+        if (q) q.last_error = args.p_error;
+        return send(200, null);
+      }
+      case 'hls_enqueue_reconcile':
+        return send(200, 0);
+    }
   }
   if (u.pathname.startsWith('/storage/v1/object/list/')) {
     const bucket = u.pathname.split('/').pop();
-    const { prefix } = JSON.parse(raw.toString());
-    const names = [...objects.keys()]
-      .filter(k => k.startsWith(`${bucket}/${prefix}/`))
-      .map(k => k.slice(`${bucket}/${prefix}/`.length))
-      .filter(n => !n.includes('/'));
-    return send(200, names.map(n => ({ name: n, id: `obj-${n}` })));
+    const { prefix, limit = 100, offset = 0 } = JSON.parse(raw.toString());
+    const base = `${bucket}/${prefix}/`;
+    const files: Row[] = [];
+    const dirs = new Set<string>();
+    for (const [k, v] of objects) {
+      if (!k.startsWith(base)) continue;
+      const rest = k.slice(base.length);
+      const slash = rest.indexOf('/');
+      if (slash < 0) {
+        const t = new Date(v.modifiedAt).toISOString();
+        files.push({ name: rest, id: `obj-${rest}`, updated_at: t, created_at: t });
+      } else {
+        dirs.add(rest.slice(0, slash));
+      }
+    }
+    const all = [...[...dirs].sort().map(d => ({ name: d, id: null })), ...files.sort((a, b) => a.name.localeCompare(b.name))];
+    return send(200, all.slice(offset, offset + limit));
   }
   if (u.pathname.startsWith('/storage/v1/object/')) {
     const key = decodeURIComponent(u.pathname.slice('/storage/v1/object/'.length));
     if (req.method === 'DELETE') {
       const { prefixes } = JSON.parse(raw.toString());
+      for (const p of prefixes) {
+        if ([...faults.failRemove].some(f => `${key}/${p}`.startsWith(f))) {
+          return send(500, { statusCode: '500', error: 'internal', message: 'simulated remove failure' });
+        }
+      }
       for (const p of prefixes) objects.delete(`${key}/${p}`);
       return send(200, prefixes.map((p: string) => ({ name: p })));
     }
     if (req.method === 'GET') {
-      const data = objects.get(key);
-      if (!data) return send(400, { statusCode: '404', error: 'not_found', message: 'Object not found' });
+      const o = objects.get(key);
+      if (!o) return send(400, { statusCode: '404', error: 'not_found', message: 'Object not found' });
       res.statusCode = 200;
-      return res.end(data);
+      return res.end(o.data);
     }
     if (req.method === 'POST' || req.method === 'PUT') {
-      objects.set(key, raw);
       const m = /^FlutterFlow\/converted\/([^/]+)\/hls\//.exec(key);
-      const hook = m && hooks.onUpload.get(m[1]);
-      if (hook) { hooks.onUpload.delete(m![1]); hook(); }
+      if (m) {
+        const post = m[1];
+        const counter = (uploads.get(post) ?? 0) + 1;
+        uploads.set(post, counter);
+        if (faults.failUpload.get(post) === counter) {
+          return send(500, { statusCode: '500', error: 'internal', message: 'simulated upload failure' });
+        }
+        objects.set(key, { data: raw, modifiedAt: Date.now() });
+        const hook = faults.onUpload.get(post);
+        if (hook && hook.n === counter) { faults.onUpload.delete(post); hook.run(); }
+        return send(200, { Key: key });
+      }
+      objects.set(key, { data: raw, modifiedAt: Date.now() });
       return send(200, { Key: key });
     }
   }
   send(404, { message: `mock: no route for ${req.method} ${u.pathname}` });
 });
+const uploads = new Map<string, number>();
 
 let server: ChildProcess;
 let port = 0;
@@ -144,10 +227,23 @@ async function call(route: string, payload: unknown, method = 'POST') {
   });
   return { status: r.status, json: await r.json().catch(() => null) as any };
 }
-const hlsKeys = (n: number) => [...objects.keys()].filter(k => k.startsWith(`FlutterFlow/converted/${id(n)}/`));
+const hlsKeys = (n: number) => [...objects.keys()].filter(k => k.startsWith(`FlutterFlow/converted/${id(n)}/`)).sort();
 const convert = (n: number, over: Row = {}) => call('/api/process-from-storage', {
   videoPath: posts.get(id(n))?.media_path ?? `u${n}/v.mp4`, bucket: 'unfiltered', videoId: id(n), postId: id(n), ...over,
 });
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+async function until(cond: () => boolean, what: string, ms = 5000) {
+  for (const end = Date.now() + ms; Date.now() < end; await sleep(50)) if (cond()) return;
+  assert.fail(`timed out waiting for: ${what}`);
+}
+function enqueue(n: number) {
+  queue.set(id(n), { post_id: id(n), queued_at: new Date().toISOString(), attempts: 0, next: 0 });
+}
+/** The attempt folder hls_url points at, e.g. FlutterFlow/converted/<id>/hls/v…/ */
+const publishedPrefix = (n: number) => {
+  const url: string = posts.get(id(n))!.hls_url;
+  return 'FlutterFlow/' + url.slice(BASE.length).replace(/master\.m3u8$/, '');
+};
 
 before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hls-routes-'));
@@ -170,14 +266,22 @@ before(async () => {
       API_KEY: KEY, PORT: String(port), TEMP_DIR: path.join(tmp, 'work'),
       SOURCE_BUCKET: 'FlutterFlow', TARGET_BUCKET: 'FlutterFlow', TARGET_FOLDER: 'converted',
       PUBLIC_STORAGE_BASE_URL: BASE, ENABLE_ADMIN_ROUTES: '', LOG_LEVEL: 'error',
+      HLS_RECONCILE_INTERVAL_MS: '150', HLS_QUEUE_HEALTH_MS: '1000', HLS_STALE_MS: String(HOUR),
     },
     stdio: ['ignore', 'ignore', 'inherit'],
   });
   for (let i = 0; i < 100; i++) {
-    try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return; } catch { /* starting */ }
-    await new Promise(r => setTimeout(r, 200));
+    try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch { /* starting */ }
+    await sleep(200);
   }
-  throw new Error('server did not start');
+  for (let i = 0; i < 50; i++) {
+    const h = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+    // (No such field before the queue existed; lets these tests run against
+    // older builds to show which failures they reproduce.)
+    if (h.revocationQueue === 'ok' || h.revocationQueue === undefined) return;
+    await sleep(100);
+  }
+  throw new Error('server did not start with a healthy queue');
 });
 
 after(() => {
@@ -189,7 +293,7 @@ after(() => {
 function seed(n: number, over: Row = {}) {
   const row = privPost(n, over);
   posts.set(row.id, row);
-  if (row.media_path) objects.set(`${row.media_bucket}/${row.media_path}`, clip);
+  if (row.media_path) objects.set(`${row.media_bucket}/${row.media_path}`, { data: clip, modifiedAt: Date.now() });
   return row;
 }
 
@@ -200,12 +304,13 @@ test('admin-only routes are off by default', async () => {
   assert.equal((await call('/api/validate', {})).status, 404);
 });
 
-test('an eligible private video is converted into its own folder and published', async () => {
+test('an eligible private video is converted into its own attempt folder and published', async () => {
   const row = seed(1);
   const r = await convert(1);
   assert.equal(r.status, 200, JSON.stringify(r.json));
-  assert.equal(row.hls_url, `${BASE}converted/${id(1)}/hls/master.m3u8`);
-  assert.ok(hlsKeys(1).includes(`FlutterFlow/converted/${id(1)}/hls/master.m3u8`));
+  assert.match(row.hls_url, new RegExp(`^${BASE}converted/${id(1)}/hls/v\\d{13}-[0-9a-z]{8}/master\\.m3u8$`));
+  assert.ok(objects.has(`${publishedPrefix(1)}master.m3u8`));
+  assert.ok(hlsKeys(1).every(k => k.startsWith(publishedPrefix(1))));
 });
 
 test('the caller cannot choose the output folder or another post', async () => {
@@ -234,79 +339,222 @@ test('ineligible private videos are refused before any work', async () => {
   }
 });
 
-test('a post hidden during conversion gets nothing published, and its files are removed', async () => {
-  const row = seed(8);
-  hooks.onUpload.set(id(8), () => { row.is_hidden = true; });
-  const r = await convert(8);
+test('R3: every policy change during conversion stops publication and removes the attempt', async () => {
+  const cases: [string, Row, (r: Row) => void][] = [
+    ['hidden', {}, r => { r.is_hidden = true; }],
+    ['made VIP', {}, r => { r.is_vip = true; }],
+    ['row deleted', {}, r => { posts.delete(r.id); }],
+    ['Unfiltered-only post moved to channel standard', { channel: 'unfiltered', in_general_feed: false }, r => { r.channel = 'standard'; }],
+    ['General Feed post taken out of the feed', {}, r => { r.in_general_feed = false; }],
+    ['access type made PRIVATE', {}, r => { r.type = 'PRIVATE'; }],
+    ['became a carousel', {}, r => { r.media_count = 3; }],
+    ['no longer a video', {}, r => { r.post_type = 'photo'; }],
+    ['given an expiry', {}, r => { r.expires_at = '2099-01-01T00:00:00Z'; }],
+    ['media replaced', {}, r => { r.media_path = 'u0/other.mp4'; }],
+  ];
+  let n = 100;
+  for (const [what, over, change] of cases) {
+    n++;
+    const row = seed(n, over);
+    faults.onUpload.set(id(n), { n: 1, run: () => change(row) });
+    const r = await convert(n);
+    assert.equal(r.status, 409, `${what}: ${JSON.stringify(r.json)}`);
+    assert.equal(posts.get(id(n))?.hls_url ?? null, null, what);
+    assert.deepEqual(hlsKeys(n), [], `${what}: files left behind`);
+  }
+});
+
+test('R3: an account deletion that starts during conversion revokes what was published', async () => {
+  const row = seed(120);
+  faults.onUpload.set(id(120), { n: 1, run: () => deletionJobs.push({ id: 'job-120', profile_id: 'profile-120' }) });
+  const r = await convert(120);
   assert.equal(r.status, 409, JSON.stringify(r.json));
   assert.equal(row.hls_url, null);
-  assert.deepEqual(hlsKeys(8), []);
+  assert.deepEqual(hlsKeys(120), []);
 });
 
-test('a post deleted during conversion gets nothing published, and its files are removed', async () => {
-  seed(9);
-  hooks.onUpload.set(id(9), () => { posts.delete(id(9)); });
-  const r = await convert(9);
-  assert.equal(r.status, 409, JSON.stringify(r.json));
-  assert.deepEqual(hlsKeys(9), []);
+test('R1: an upload that fails part-way leaves no public files', async () => {
+  const row = seed(8);
+  faults.failUpload.set(id(8), 3);
+  const r = await convert(8);
+  assert.equal(r.status, 500, JSON.stringify(r.json));
+  assert.equal(row.hls_url, null);
+  assert.deepEqual(hlsKeys(8), [], 'the two files uploaded before the failure were removed');
+  faults.failUpload.delete(id(8));
+  assert.equal((await convert(8)).status, 200, 'a later attempt succeeds');
 });
 
-test('a database failure is reported as a failure, and its files are removed', async () => {
+test('a database failure on publish is a failure, and the attempt is removed', async () => {
   const row = seed(10);
-  hooks.failPatch.add(id(10));
+  faults.patch.set(id(10), 'error');
   const r = await convert(10);
   assert.equal(r.status, 500, JSON.stringify(r.json));
   assert.equal(row.hls_url, null);
   assert.deepEqual(hlsKeys(10), []);
+  faults.patch.delete(id(10));
+});
+
+test('a publish that committed before failing is recognised, and its files are kept', async () => {
+  const row = seed(11);
+  faults.patch.set(id(11), 'commit-then-error');
+  const r = await convert(11);
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.ok(row.hls_url);
+  assert.ok(objects.has(`${publishedPrefix(11)}master.m3u8`));
+  faults.patch.delete(id(11));
+});
+
+test('when the publish outcome cannot be known, nothing is deleted', async () => {
+  const row = seed(12);
+  // The UPDATE commits, its answer is lost, and the re-read fails too.
+  faults.patch.set(id(12), 'commit-then-unreadable');
+  const r = await convert(12);
+  faults.patch.delete(id(12));
+  faults.failRead.delete(id(12));
+  assert.equal(r.status, 500, JSON.stringify(r.json));
+  assert.ok(row.hls_url, 'the row was published');
+  assert.ok(objects.has(`${publishedPrefix(12)}master.m3u8`), 'and its files are intact');
+});
+
+test('R2: a repeat request never touches a published rendition, even when the database fails', async () => {
+  const row = seed(13);
+  assert.equal((await convert(13)).status, 200);
+  const url = row.hls_url;
+  const files = hlsKeys(13);
+
+  const again = await convert(13);
+  assert.equal(again.status, 200);
+  assert.equal(again.json.alreadyPublished, true);
+
+  faults.patch.set(id(13), 'error');
+  const patchesBefore = sent.patches.filter(p => p === id(13)).length;
+  const failing = await convert(13);
+  faults.patch.delete(id(13));
+  assert.equal(failing.status, 200, JSON.stringify(failing.json));
+  assert.equal(row.hls_url, url);
+  assert.deepEqual(hlsKeys(13), files, 'no file was removed or added');
+  assert.equal(sent.patches.filter(p => p === id(13)).length, patchesBefore, 'no second publish was attempted');
+});
+
+test('R2: concurrent conversions publish once; the loser removes only its own folder', async () => {
+  const row = seed(14);
+  const [a, b] = await Promise.all([convert(14), convert(14)]);
+  assert.deepEqual([a.status, b.status].sort(), [200, 200]);
+  assert.ok(row.hls_url);
+  const keep = publishedPrefix(14);
+  assert.ok(objects.has(`${keep}master.m3u8`));
+  assert.deepEqual(hlsKeys(14).filter(k => !k.startsWith(keep)), [], 'the losing attempt left nothing');
+});
+
+test('R4: private media is not converted while the revocation queue is down; legacy still is', async () => {
+  seed(15);
+  const legacy = seed(16, {
+    media_bucket: null, media_path: null, media_count: 1, post_type: 'video',
+    channel: 'standard', in_general_feed: false, type: 'PUBLIC',
+    video_url: 'https://ref.supabase.co/storage/v1/object/public/FlutterFlow/Videos/16.mp4',
+  });
+  objects.set('FlutterFlow/Videos/16.mp4', { data: clip, modifiedAt: Date.now() });
+  faults.queueDown = true;
+  await sleep(1300);
+  const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+  assert.equal(health.revocationQueue, 'unavailable');
+  const r = await convert(15);
+  assert.equal(r.status, 503, JSON.stringify(r.json));
+  assert.deepEqual(hlsKeys(15), []);
+  const l = await call('/api/process-from-storage', { videoPath: 'Videos/16.mp4', bucket: 'FlutterFlow', postId: id(16) });
+  assert.equal(l.status, 200, JSON.stringify(l.json));
+  assert.ok(legacy.hls_url);
+  faults.queueDown = false;
+  await sleep(400);
+  assert.equal((await convert(15)).status, 200, 'converts again once the queue is back');
 });
 
 test('revoke keeps an eligible post\'s HLS and removes an ineligible one\'s', async () => {
-  const row = seed(11);
-  assert.equal((await convert(11)).status, 200);
-  assert.ok(hlsKeys(11).length > 0);
-
-  assert.equal((await call('/api/revoke-hls', { postId: id(11) })).status, 409);
-  assert.ok(hlsKeys(11).length > 0, 'an eligible post keeps its HLS');
+  const row = seed(20);
+  assert.equal((await convert(20)).status, 200);
+  assert.equal((await call('/api/revoke-hls', { postId: id(20) })).status, 409);
+  assert.ok(hlsKeys(20).length > 0, 'an eligible post keeps its HLS');
 
   row.is_hidden = true;
-  const hidden = await call('/api/revoke-hls', { postId: id(11) });
+  const hidden = await call('/api/revoke-hls', { postId: id(20) });
   assert.equal(hidden.status, 200);
   assert.ok(hidden.json.removed > 0);
-  assert.deepEqual(hlsKeys(11), []);
+  assert.deepEqual(hlsKeys(20), []);
   assert.equal(row.hls_url, null);
-});
-
-test('revoke after the post row is deleted removes its HLS', async () => {
-  seed(12);
-  assert.equal((await convert(12)).status, 200);
-  posts.delete(id(12));
-  const r = await call('/api/revoke-hls', { postId: id(12) });
-  assert.equal(r.status, 200);
-  assert.deepEqual(hlsKeys(12), []);
   assert.equal((await call('/api/revoke-hls', { postId: '../x' })).status, 400);
 });
 
 test('a folder another post plays from is neither overwritten nor removed', async () => {
-  seed(14);
-  objects.set(`FlutterFlow/converted/${id(14)}/hls/master.m3u8`, Buffer.from('#EXTM3U'));
-  seed(15, { hls_url: `${BASE}converted/${id(14)}/hls/master.m3u8` });
-  assert.equal((await convert(14)).status, 409);
-  posts.delete(id(14));
-  assert.equal((await call('/api/revoke-hls', { postId: id(14) })).status, 409);
-  assert.equal(hlsKeys(14).length, 1);
+  seed(21);
+  objects.set(`FlutterFlow/converted/${id(21)}/hls/master.m3u8`, { data: Buffer.from('#EXTM3U'), modifiedAt: Date.now() });
+  seed(22, { hls_url: `${BASE}converted/${id(21)}/hls/master.m3u8` });
+  assert.equal((await convert(21)).status, 409);
+  posts.delete(id(21));
+  assert.equal((await call('/api/revoke-hls', { postId: id(21) })).status, 409);
+  assert.equal(hlsKeys(21).length, 1);
+});
+
+test('R4: the queue removes a deleted post\'s copy with no app request at all', async () => {
+  seed(30);
+  assert.equal((await convert(30)).status, 200);
+  posts.delete(id(30));          // the app's revoke request never arrives
+  enqueue(30);                   // the database's delete trigger
+  await until(() => !queue.has(id(30)), 'queue entry completed');
+  assert.deepEqual(hlsKeys(30), []);
+});
+
+test('R4: a failed revocation stays queued and is retried until it succeeds', async () => {
+  const row = seed(31);
+  assert.equal((await convert(31)).status, 200);
+  row.is_hidden = true;
+  faults.failRemove.add(`FlutterFlow/converted/${id(31)}/`);
+  enqueue(31);
+  await until(() => (queue.get(id(31))?.attempts ?? 0) >= 2, 'two failed attempts');
+  assert.match(queue.get(id(31))!.last_error ?? '', /remove/);
+  assert.ok(hlsKeys(31).length > 0);
+  faults.failRemove.clear();
+  await until(() => !queue.has(id(31)), 'retried to completion');
+  assert.deepEqual(hlsKeys(31), []);
+  assert.equal(row.hls_url, null);
+});
+
+test('R4: reconcile removes stale leftovers but keeps the published copy and attempts in flight', async () => {
+  seed(32);
+  assert.equal((await convert(32)).status, 200);
+  const keep = hlsKeys(32);
+  const old = Date.now() - 2 * HOUR;
+  objects.set(`FlutterFlow/converted/${id(32)}/hls/v0000000000001-oldoldol/360p_000.ts`, { data: Buffer.from('x'), modifiedAt: old });
+  objects.set(`FlutterFlow/converted/${id(32)}/hls/master.m3u8`, { data: Buffer.from('x'), modifiedAt: old });
+  objects.set(`FlutterFlow/converted/${id(32)}/hls/v9999999999999-inflight/360p_000.ts`, { data: Buffer.from('x'), modifiedAt: Date.now() });
+  enqueue(32);
+  await until(() => !queue.has(id(32)), 'queue entry completed');
+  assert.deepEqual(hlsKeys(32), [...keep, `FlutterFlow/converted/${id(32)}/hls/v9999999999999-inflight/360p_000.ts`].sort());
 });
 
 test('a legacy public post converts only from its own video_url', async () => {
-  const row = seed(13, {
-    media_bucket: null, media_path: null, media_count: null, post_type: null,
-    channel: null, in_general_feed: null, type: 'PUBLIC',
-    video_url: 'https://ref.supabase.co/storage/v1/object/public/FlutterFlow/Videos/13.mp4',
+  const row = seed(40, {
+    media_bucket: null, media_path: null, media_count: 1, post_type: 'video',
+    channel: 'standard', in_general_feed: false, type: 'PUBLIC',
+    video_url: 'https://ref.supabase.co/storage/v1/object/public/FlutterFlow/Videos/40.mp4',
   });
-  objects.set('FlutterFlow/Videos/13.mp4', clip);
+  objects.set('FlutterFlow/Videos/40.mp4', { data: clip, modifiedAt: Date.now() });
   const legacy = (videoPath: string) => call('/api/process-from-storage', {
-    videoPath, bucket: 'FlutterFlow', videoId: id(13), postId: id(13),
+    videoPath, bucket: 'FlutterFlow', videoId: id(40), postId: id(40),
   });
   assert.equal((await legacy('Videos/other.mp4')).status, 403);
-  assert.equal((await legacy('Videos/13.mp4')).status, 200);
-  assert.equal(row.hls_url, `${BASE}converted/${id(13)}/hls/master.m3u8`);
+  assert.equal((await legacy('Videos/40.mp4')).status, 200);
+  assert.match(row.hls_url, new RegExp(`^${BASE}converted/${id(40)}/hls/v`));
+});
+
+test('revoking a hidden legacy post also removes a copy it alone plays from another folder', async () => {
+  const row = seed(41, {
+    media_bucket: null, media_path: null, type: 'PUBLIC', is_hidden: true,
+    video_url: 'https://ref.supabase.co/storage/v1/object/public/FlutterFlow/Videos/41.mp4',
+    hls_url: `${BASE}converted/1736606618523/hls/master.m3u8`,
+  });
+  objects.set('FlutterFlow/converted/1736606618523/hls/master.m3u8', { data: Buffer.from('#EXTM3U'), modifiedAt: Date.now() });
+  const r = await call('/api/revoke-hls', { postId: id(41) });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.equal(objects.has('FlutterFlow/converted/1736606618523/hls/master.m3u8'), false);
+  assert.equal(row.hls_url, null);
 });

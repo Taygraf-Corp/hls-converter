@@ -91,3 +91,35 @@ test('revoke is required exactly when the post may no longer have HLS', () => {
   assert.equal(revokeRequired(legacy({ expires_at: '2026-01-01T00:00:00Z' }), false, NOW), true);
   assert.equal(revokeRequired(legacy({ video_url: null }), false, NOW), true);
 });
+
+test('R3: the publishing UPDATE re-applies exactly the conversion policy', async () => {
+  const { publishConditions, rowMeets } = await import('../src/services/hls-policy.js');
+  // Every single-field change an eligible row can undergo: the UPDATE's
+  // conditions must accept the changed row exactly when conversionRefusal
+  // would still accept it from the same source (and hls_url is still null).
+  const mutations: Partial<PostRow>[] = [
+    { is_hidden: true }, { is_hidden: null }, { is_vip: true }, { is_vip: null },
+    { channel: 'standard' }, { channel: 'unfiltered' }, { in_general_feed: false }, { in_general_feed: true },
+    { in_general_feed: null }, { type: 'PRIVATE' }, { type: 'PUBLIC' }, { type: 'UNFILTERED' },
+    { media_count: 2 }, { media_count: null }, { media_count: 1 }, { post_type: 'photo' },
+    { expires_at: '2027-01-01T00:00:00Z' }, { expires_at: '2026-01-01T00:00:00Z' }, { expires_at: null },
+    { media_path: 'u1/b.mp4' }, { media_bucket: 'FlutterFlow' }, { video_url: PUBLIC.replace('1.mp4', '2.mp4') },
+    { video_url: null }, { media_path: null, media_bucket: null }, { hls_url: 'https://x/converted/y/hls/master.m3u8' },
+  ];
+  const starts: [PostRow, string, string][] = [
+    [priv(), 'unfiltered', 'u1/a.mp4'],
+    [priv({ channel: 'unfiltered', in_general_feed: false }), 'unfiltered', 'u1/a.mp4'],
+    [legacy(), 'FlutterFlow', 'Videos/1.mp4'],
+    [legacy({ expires_at: '2027-01-01T00:00:00Z' }), 'FlutterFlow', 'Videos/1.mp4'],
+  ];
+  for (const [start, bucket, objectPath] of starts) {
+    assert.equal(conversionRefusal(start, bucket, objectPath, false, NOW), null);
+    const conds = publishConditions(start, NOW);
+    assert.equal(rowMeets(start, conds), true);
+    for (const m of mutations) {
+      const changed = { ...start, ...m };
+      const allowed = changed.hls_url === null && conversionRefusal(changed, bucket, objectPath, false, NOW) === null;
+      assert.equal(rowMeets(changed, conds), allowed, `${JSON.stringify(m)} from ${start.media_path ? 'private' : 'legacy'}`);
+    }
+  }
+});

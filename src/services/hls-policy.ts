@@ -171,3 +171,100 @@ export function revokeRequired(
   }
   return conversionRefusal(post, source.bucket, source.path, deletionPending, now) !== null;
 }
+
+// ---------------------------------------------------------------------------
+// Publication (CTO re-review 2026-11-02, R1-R3)
+// ---------------------------------------------------------------------------
+
+/** One PostgREST filter; `or` holds alternatives. */
+export type Condition =
+  | { col: keyof PostRow; op: 'eq' | 'gt'; value: string | number }
+  | { col: keyof PostRow; op: 'is'; value: null | boolean }
+  | { col: keyof PostRow; op: 'in'; value: string[] }
+  | { or: Condition[] };
+
+/**
+ * Every condition the UPDATE that publishes hls_url must meet: the complete
+ * mutable eligibility policy of conversionRefusal() for this post's source,
+ * plus "no hls_url yet" (the first finished attempt wins). The author's
+ * deletion state lives in another table and is checked right after.
+ */
+export function publishConditions(post: PostRow, now: Date = new Date()): Condition[] {
+  const common: Condition[] = [
+    { col: 'id', op: 'eq', value: post.id },
+    { col: 'hls_url', op: 'is', value: null },
+    { or: [{ col: 'is_hidden', op: 'is', value: null }, { col: 'is_hidden', op: 'is', value: false }] },
+    { or: [{ col: 'is_vip', op: 'is', value: null }, { col: 'is_vip', op: 'is', value: false }] },
+  ];
+  if (post.media_path) {
+    return [
+      ...common,
+      { col: 'media_bucket', op: 'eq', value: post.media_bucket as string },
+      { col: 'media_path', op: 'eq', value: post.media_path },
+      { or: [{ col: 'media_count', op: 'is', value: null }, { col: 'media_count', op: 'eq', value: 1 }] },
+      { col: 'post_type', op: 'eq', value: 'video' },
+      { or: [{ col: 'channel', op: 'eq', value: 'unfiltered' }, { col: 'in_general_feed', op: 'is', value: true }] },
+      { col: 'type', op: 'in', value: ['UNFILTERED', 'PUBLIC'] },
+      { col: 'expires_at', op: 'is', value: null },
+    ];
+  }
+  return [
+    ...common,
+    { col: 'media_path', op: 'is', value: null },
+    { col: 'video_url', op: 'eq', value: post.video_url as string },
+    { or: [{ col: 'expires_at', op: 'is', value: null }, { col: 'expires_at', op: 'gt', value: now.toISOString() }] },
+  ];
+}
+
+/** Evaluate conditions the way PostgREST would (for tests and local checks). */
+export function rowMeets(row: PostRow, conditions: Condition[]): boolean {
+  const one = (c: Condition): boolean => {
+    if ('or' in c) return c.or.some(one);
+    const cell = row[c.col] as unknown;
+    switch (c.op) {
+      case 'eq': return cell !== null && cell !== undefined && String(cell) === String(c.value);
+      case 'is': return c.value === null ? cell === null || cell === undefined : cell === c.value;
+      case 'in': return cell !== null && cell !== undefined && c.value.includes(String(cell));
+      case 'gt': {
+        if (cell === null || cell === undefined) return false;
+        return Date.parse(String(cell)) > Date.parse(String(c.value));
+      }
+    }
+  };
+  return conditions.every(one);
+}
+
+/** Attempt folders: v<13-digit epoch ms>-<8 chars>, so names sort by start time. */
+export const ATTEMPT_DIR = /^v\d{13}-[0-9a-z]{8}$/;
+
+export function newAttemptId(now: number = Date.now()): string {
+  const rand = Math.random().toString(36).slice(2, 10).padEnd(8, '0');
+  return `v${String(now).padStart(13, '0')}-${rand}`;
+}
+
+/**
+ * The storage directory (inside the public bucket) that a published hls_url's
+ * master playlist sits in, or null when the URL is not a public object URL.
+ */
+export function publishedDir(hlsUrl: string | null, bucket: string): string | null {
+  if (!hlsUrl) return null;
+  const marker = `/storage/v1/object/public/${bucket}/`;
+  const at = hlsUrl.indexOf(marker);
+  if (at < 0) return null;
+  let objectPath: string;
+  try {
+    objectPath = decodeURIComponent(hlsUrl.slice(at + marker.length).split('?')[0]);
+  } catch {
+    return null;
+  }
+  const slash = objectPath.lastIndexOf('/');
+  return slash > 0 ? objectPath.slice(0, slash) : null;
+}
+
+/** converted/<x>/hls for a directory inside it, or null. */
+export function hlsRootOf(dir: string | null, root: string = HLS_ROOT): string | null {
+  if (!dir) return null;
+  const parts = dir.split('/');
+  if (parts.length < 3 || parts[0] !== root || parts[2] !== 'hls' || !parts[1]) return null;
+  return parts.slice(0, 3).join('/');
+}

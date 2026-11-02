@@ -2,9 +2,36 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { migrationConfig } from '../config/index.js';
 import { VideoFile, StorageFile } from '../types/index.js';
 import { logger } from '../utils/logger.js';
-import { POST_COLUMNS, PostRow } from './hls-policy.js';
+import { Condition, POST_COLUMNS, PostRow, publishConditions } from './hls-policy.js';
 import fs from 'fs/promises';
 import path from 'path';
+
+/** Apply publishConditions() to a PostgREST filter builder. */
+function applyConditions(q: any, conditions: Condition[]): any {
+  const literal = (c: Condition): string => {
+    if ('or' in c) {
+      throw new Error('nested or is not supported');
+    }
+    const v = c.op === 'in'
+      ? `(${(c.value as string[]).join(',')})`
+      : c.value === null ? 'null' : String(c.value);
+    return `${String(c.col)}.${c.op}.${v}`;
+  };
+  for (const c of conditions) {
+    if ('or' in c) {
+      q = q.or(c.or.map(literal).join(','));
+    } else if (c.op === 'eq') {
+      q = q.eq(c.col, c.value);
+    } else if (c.op === 'gt') {
+      q = q.gt(c.col, c.value);
+    } else if (c.op === 'is') {
+      q = q.is(c.col, c.value);
+    } else {
+      q = q.in(c.col, c.value);
+    }
+  }
+  return q;
+}
 
 export class SupabaseStorageService {
   private client: SupabaseClient;
@@ -61,30 +88,14 @@ export class SupabaseStorageService {
   }
 
   /**
-   * Set hls_url only if the row still names the same source and is still
-   * eligible at this moment (publication-time recheck, one UPDATE). Returns
-   * whether a row was updated.
+   * Publish hls_url in one UPDATE that re-applies the complete eligibility
+   * policy (publishConditions) and requires that no attempt published first.
+   * Returns whether exactly one row was updated. Throws when the database
+   * does not answer; the caller must then treat the outcome as unknown.
    */
-  async setHlsUrlIfStillEligible(post: PostRow, hlsUrl: string): Promise<boolean> {
-    let q = this.adminClient
-      .from('posts')
-      .update({ hls_url: hlsUrl })
-      .eq('id', post.id)
-      .or('is_hidden.is.null,is_hidden.eq.false')
-      .or('is_vip.is.null,is_vip.eq.false');
-
-    if (post.media_path) {
-      q = q
-        .eq('media_bucket', post.media_bucket as string)
-        .eq('media_path', post.media_path)
-        .is('expires_at', null);
-    } else {
-      q = q.is('media_path', null).eq('video_url', post.video_url as string);
-      q = post.expires_at
-        ? q.gt('expires_at', new Date().toISOString())
-        : q.is('expires_at', null);
-    }
-
+  async publishHlsUrl(post: PostRow, hlsUrl: string, now: Date = new Date()): Promise<boolean> {
+    let q: any = this.adminClient.from('posts').update({ hls_url: hlsUrl });
+    q = applyConditions(q, publishConditions(post, now));
     const { data, error } = await q.select('id');
     if (error) {
       throw new Error(`Failed to set hls_url: ${error.message}`);
@@ -92,13 +103,23 @@ export class SupabaseStorageService {
     return (data ?? []).length === 1;
   }
 
-  /** Clear hls_url when it still points at this post's own folder. */
-  async clearHlsUrl(postId: string, folder: string): Promise<void> {
+  /** The row's current hls_url (undefined when the row is gone). */
+  async getHlsUrl(postId: string): Promise<string | null | undefined> {
+    const { data, error } = await this.adminClient
+      .from('posts').select('hls_url').eq('id', postId).maybeSingle();
+    if (error) {
+      throw new Error(`Failed to read hls_url: ${error.message}`);
+    }
+    return data ? ((data as { hls_url: string | null }).hls_url ?? null) : undefined;
+  }
+
+  /** Clear hls_url if it is still exactly [hlsUrl]. */
+  async clearHlsUrl(postId: string, hlsUrl: string): Promise<void> {
     const { error } = await this.adminClient
       .from('posts')
       .update({ hls_url: null })
       .eq('id', postId)
-      .like('hls_url', `%/${folder}/%`);
+      .eq('hls_url', hlsUrl);
     if (error) {
       throw new Error(`Failed to clear hls_url: ${error.message}`);
     }
@@ -122,33 +143,97 @@ export class SupabaseStorageService {
     return (data ?? []).length > 0;
   }
 
-  /** Remove every object directly inside [folder] of the target bucket. */
-  async removeFolder(folder: string, bucket?: string): Promise<number> {
+  /** Every object under [prefix], recursively, with its last-modified time. */
+  async listTree(prefix: string, bucket?: string): Promise<{ path: string; modifiedAt: number }[]> {
+    const targetBucket = bucket || migrationConfig.storage.targetBucket;
+    const out: { path: string; modifiedAt: number }[] = [];
+    const pending = [prefix];
+    let calls = 0;
+    while (pending.length > 0) {
+      const dir = pending.pop() as string;
+      for (let offset = 0; ; offset += 1000) {
+        if (++calls > 500) {
+          throw new Error(`Gave up listing ${prefix}: too many entries`);
+        }
+        const { data, error } = await this.adminClient.storage
+          .from(targetBucket)
+          .list(dir, { limit: 1000, offset });
+        if (error) {
+          throw new Error(`Failed to list ${dir}: ${error.message}`);
+        }
+        const entries = data ?? [];
+        for (const e of entries) {
+          if (e.id) {
+            const t = Date.parse((e as any).updated_at || (e as any).created_at || '');
+            out.push({ path: `${dir}/${e.name}`, modifiedAt: Number.isNaN(t) ? 0 : t });
+          } else {
+            pending.push(`${dir}/${e.name}`);
+          }
+        }
+        if (entries.length < 1000) break;
+      }
+    }
+    return out;
+  }
+
+  /** Remove these objects (in chunks). Returns how many were removed. */
+  async removeObjects(paths: string[], bucket?: string): Promise<number> {
     const targetBucket = bucket || migrationConfig.storage.targetBucket;
     let removed = 0;
-    let rounds = 0;
-    for (;;) {
-      const { data, error } = await this.adminClient.storage
-        .from(targetBucket)
-        .list(folder, { limit: 1000 });
+    for (let i = 0; i < paths.length; i += 500) {
+      const chunk = paths.slice(i, i + 500);
+      const { error } = await this.adminClient.storage.from(targetBucket).remove(chunk);
       if (error) {
-        throw new Error(`Failed to list ${folder}: ${error.message}`);
+        throw new Error(`Failed to remove objects: ${error.message}`);
       }
-      const files = (data ?? []).filter(f => f.id).map(f => `${folder}/${f.name}`);
-      if (++rounds > 50) {
-        throw new Error(`Gave up removing ${folder}: objects keep reappearing`);
-      }
-      if (files.length === 0) {
+      removed += chunk.length;
+    }
+    return removed;
+  }
+
+  /** Remove every object under [prefix], recursively, until none is left. */
+  async removeTree(prefix: string, bucket?: string): Promise<number> {
+    let removed = 0;
+    for (let round = 0; round < 5; round++) {
+      const objects = await this.listTree(prefix, bucket);
+      if (objects.length === 0) {
         return removed;
       }
-      const { error: rmError } = await this.adminClient.storage
-        .from(targetBucket)
-        .remove(files);
-      if (rmError) {
-        throw new Error(`Failed to remove from ${folder}: ${rmError.message}`);
-      }
-      removed += files.length;
+      removed += await this.removeObjects(objects.map(o => o.path), bucket);
     }
+    throw new Error(`Gave up removing ${prefix}: objects keep reappearing`);
+  }
+
+  // Reconcile queue (taygram-backend proposal 20261102130000_hls_reconcile_queue).
+
+  async claimReconcile(limit: number): Promise<{ post_id: string; queued_at: string; attempts: number }[]> {
+    const { data, error } = await this.adminClient.rpc('hls_claim_reconcile', { p_limit: limit });
+    if (error) {
+      throw new Error(`Failed to claim reconcile work: ${error.message}`);
+    }
+    return (data ?? []) as { post_id: string; queued_at: string; attempts: number }[];
+  }
+
+  async completeReconcile(postId: string, queuedAt: string): Promise<void> {
+    const { error } = await this.adminClient.rpc('hls_complete_reconcile', { p_post_id: postId, p_queued_at: queuedAt });
+    if (error) {
+      throw new Error(`Failed to complete reconcile work: ${error.message}`);
+    }
+  }
+
+  async failReconcile(postId: string, message: string): Promise<void> {
+    const { error } = await this.adminClient.rpc('hls_fail_reconcile', { p_post_id: postId, p_error: message });
+    if (error) {
+      throw new Error(`Failed to record reconcile failure: ${error.message}`);
+    }
+  }
+
+  async enqueueReconcile(limit: number): Promise<number> {
+    const { data, error } = await this.adminClient.rpc('hls_enqueue_reconcile', { p_limit: limit });
+    if (error) {
+      throw new Error(`Failed to scan for reconcile work: ${error.message}`);
+    }
+    return Number(data ?? 0);
   }
 
   /**

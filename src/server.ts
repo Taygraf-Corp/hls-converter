@@ -9,14 +9,8 @@ import { logger } from './utils/logger.js';
 import { ensureDir, cleanup, generateTempDir, getFilenameWithoutExtension } from './utils/file-utils.js';
 import { migrationConfig, resolutionSets } from './config/index.js';
 import { authenticate, isAuthEnabled } from './middleware/auth.js';
-import {
-  PUBLIC_SOURCE_BUCKET,
-  PostRow,
-  conversionRefusal,
-  hlsFolderFor,
-  isUuid,
-  revokeRequired,
-} from './services/hls-policy.js';
+import { PUBLIC_SOURCE_BUCKET, isUuid } from './services/hls-policy.js';
+import { HlsLifecycle } from './services/hls-lifecycle.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -192,11 +186,17 @@ function adminOnly(_req: Request, res: Response, next: NextFunction): void {
   next();
 }
 
-async function loadPolicyInputs(postId: string): Promise<{ post: PostRow | null; deletionPending: boolean }> {
-  const post = await storageService.getPostForHls(postId);
-  const deletionPending = post ? await storageService.hasDeletionJob(post.profile_id) : false;
-  return { post, deletionPending };
-}
+const lifecycle = new HlsLifecycle(storageService, {
+  root: migrationConfig.storage.targetFolder,
+  bucket: migrationConfig.storage.targetBucket,
+  publicBase: PUBLIC_STORAGE_BASE_URL,
+  staleMs: Number(process.env.HLS_STALE_MS || 3_600_000),
+  intervalMs: Number(process.env.HLS_RECONCILE_INTERVAL_MS ?? 60_000),
+  scanMs: Number(process.env.HLS_RECONCILE_SCAN_MS || 3_600_000),
+  batch: Number(process.env.HLS_RECONCILE_BATCH || 20),
+  requireQueue: process.env.REQUIRE_REVOCATION_QUEUE !== 'false',
+  healthMs: Number(process.env.HLS_QUEUE_HEALTH_MS || 300_000),
+});
 
 // Routes
 
@@ -211,8 +211,11 @@ app.get('/', adminOnly, (req: Request, res: Response) => {
  * Health check
  */
 app.get('/health', (req: Request, res: Response) => {
-  res.json({ 
+  res.json({
     status: 'ok',
+    // 'ok' while the HLS revocation queue is drained; private media is only
+    // converted then. The ALB health check only needs the 200.
+    revocationQueue: lifecycle.queueHealthy() ? 'ok' : 'unavailable',
     timestamp: new Date().toISOString()
   });
 });
@@ -386,13 +389,13 @@ app.post('/api/metadata', adminOnly, authenticate, express.json(), async (req: R
 /**
  * Convert one post's own video to HLS and set its hls_url.
  *
- * Body: { postId, videoPath, bucket?, videoId? }. postId is required; the
- * output folder is always converted/<postId>/hls, derived here, never taken
- * from the caller (CTO review finding 2). The post row decides whether the
- * source may be converted (hls-policy.ts); hls_url is set in one UPDATE that
- * rechecks eligibility, and on any refusal the uploaded files are removed.
- * 200 only when hls_url was written; 403 refused up front; 409 the post
- * changed during conversion; 500 failure (nothing left published).
+ * Body: { postId, videoPath, bucket?, videoId? }. postId is required and the
+ * output folder is derived from it (converted/<postId>/hls/<attempt>/). The
+ * post row decides; see services/hls-lifecycle.ts for the full contract.
+ * 200 published (or already had HLS); 403 refused; 409 the post changed or
+ * another post owns the folder; 503 private media while the revocation queue
+ * is down; 500 failure (this attempt's files removed, or left for the
+ * reconciler when the database outcome is unknown).
  */
 app.post('/api/process-from-storage', authenticate, express.json(), async (req: Request, res: Response) => {
   const { videoPath, bucket, videoId, postId } = req.body ?? {};
@@ -406,68 +409,32 @@ app.post('/api/process-from-storage', authenticate, express.json(), async (req: 
     return res.status(400).json({ success: false, error: 'videoId, when given, must equal postId' });
   }
   const sourceBucket: string = typeof bucket === 'string' && bucket ? bucket : PUBLIC_SOURCE_BUCKET;
-  const folder = hlsFolderFor(postId, migrationConfig.storage.targetFolder);
 
   let tempDir: string | null = null;
-  let uploaded: string[] = [];
   try {
-    const before = await loadPolicyInputs(postId);
-    const refusal = conversionRefusal(before.post, sourceBucket, videoPath, before.deletionPending);
-    if (refusal || !before.post) {
-      logger.warn(`Refused process-from-storage: ${refusal}`);
-      return res.status(403).json({ success: false, error: refusal });
-    }
-    const post = before.post;
-    if (await storageService.otherPostUsesFolder(postId, folder)) {
-      logger.warn('Refused process-from-storage: another post plays from this folder');
-      return res.status(409).json({ success: false, error: 'another post plays HLS from this folder' });
-    }
-
-    const videoFile: VideoFile = { name: path.basename(videoPath), path: videoPath, size: 0, bucket: sourceBucket };
-    logger.info('Processing from storage');
-    tempDir = generateTempDir(migrationConfig.processing.tempDir, 'storage-process');
-    await ensureDir(tempDir);
-    const tempPath = path.join(tempDir, videoFile.name);
-    await storageService.downloadFile(videoFile, tempPath);
-
-    const result = await processVideo(tempPath, videoFile.name, folder);
-    uploaded = result.outputFiles ?? [];
-    if (!result.success) {
-      throw new Error(result.error || 'conversion failed');
-    }
-    const master = uploaded.find(f => f.endsWith('master.m3u8'));
-    if (!master) {
-      throw new Error('no master playlist was produced');
-    }
-
-    // Publication-time recheck: the row must still be eligible and name the
-    // same source, in the same UPDATE that publishes the URL.
-    const published = await storageService.setHlsUrlIfStillEligible(post, `${PUBLIC_STORAGE_BASE_URL}${master}`);
-    if (!published) {
-      await storageService.removeFolder(folder);
-      uploaded = [];
-      logger.warn('Post changed during conversion; HLS removed');
-      return res.status(409).json({ success: false, error: 'post is no longer eligible; nothing published' });
-    }
-
-    logger.info('Successfully set hls_url');
-    return res.json({
-      success: true,
-      message: 'Video processed successfully',
-      data: {
-        outputFiles: uploaded,
-        metadata: result.metadata,
-        processingTime: result.processingTime,
-        masterPlaylist: master
+    const outcome = await lifecycle.convert(postId.toLowerCase(), sourceBucket, videoPath, async (attemptDir) => {
+      const videoFile: VideoFile = { name: path.basename(videoPath), path: videoPath, size: 0, bucket: sourceBucket };
+      tempDir = generateTempDir(migrationConfig.processing.tempDir, 'storage-process');
+      await ensureDir(tempDir);
+      const tempPath = path.join(tempDir, videoFile.name);
+      await storageService.downloadFile(videoFile, tempPath);
+      const result = await processVideo(tempPath, videoFile.name, attemptDir);
+      if (!result.success) {
+        throw new Error(result.error || 'conversion failed');
       }
+      const files = result.outputFiles ?? [];
+      const master = files.find(f => f.endsWith('master.m3u8'));
+      if (!master) {
+        throw new Error('no master playlist was produced');
+      }
+      return { master, files, metadata: result.metadata, processingTime: result.processingTime };
     });
+    if (outcome.status !== 200) {
+      logger.warn(`process-from-storage: ${outcome.status} ${String(outcome.body.error ?? '')}`);
+    }
+    return res.status(outcome.status).json(outcome.body);
   } catch (error) {
     logger.error('Process from storage error:', error);
-    if (uploaded.length > 0) {
-      // Never leave a public copy that no row points at.
-      await storageService.removeFolder(folder).catch(err =>
-        logger.error('Failed to remove HLS after an error:', err));
-    }
     return res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Processing failed'
@@ -480,11 +447,11 @@ app.post('/api/process-from-storage', authenticate, express.json(), async (req: 
 });
 
 /**
- * Remove a post's public HLS when it must no longer exist: the post was
- * deleted, hidden, made VIP, expired, its media changed, or its author is being
- * deleted (CTO review finding 3). A post that is still eligible keeps its HLS
- * (409), so the app's key cannot be used to strip anyone's video.
- * Body: { postId }.
+ * Remove a post's public HLS when it must no longer exist (deleted, hidden,
+ * VIP, expired, unpublished, media changed, author being deleted). A post that
+ * is still eligible keeps its HLS (409), so the app's key cannot strip anyone's
+ * video. The database queue retries this on its own; the app's call after a
+ * delete is only the fast path. Body: { postId }.
  */
 app.post('/api/revoke-hls', authenticate, express.json(), async (req: Request, res: Response) => {
   const { postId } = req.body ?? {};
@@ -492,20 +459,15 @@ app.post('/api/revoke-hls', authenticate, express.json(), async (req: Request, r
     return res.status(400).json({ success: false, error: 'postId (a UUID) is required' });
   }
   try {
-    const { post, deletionPending } = await loadPolicyInputs(postId);
-    if (!revokeRequired(post, deletionPending)) {
+    const r = await lifecycle.revoke(postId.toLowerCase());
+    if (!r.revoked) {
       return res.status(409).json({ success: false, error: 'post is still eligible; HLS kept' });
     }
-    const folder = hlsFolderFor(postId, migrationConfig.storage.targetFolder);
-    if (await storageService.otherPostUsesFolder(postId, folder)) {
-      return res.status(409).json({ success: false, error: 'another post plays HLS from this folder; kept' });
+    if (r.kept) {
+      return res.status(409).json({ success: false, error: `${r.kept}; kept`, removed: r.removed });
     }
-    const removed = await storageService.removeFolder(folder);
-    if (post) {
-      await storageService.clearHlsUrl(postId, folder);
-    }
-    logger.info(`Revoked HLS: ${removed} object(s) removed`);
-    return res.json({ success: true, removed });
+    logger.info(`Revoked HLS: ${r.removed} object(s) removed`);
+    return res.json({ success: true, removed: r.removed });
   } catch (error) {
     logger.error('Revoke HLS error:', error);
     return res.status(500).json({
@@ -566,6 +528,7 @@ app.use((req: Request, res: Response) => {
 
 // Start server
 app.listen(PORT, () => {
+  lifecycle.start();
   logger.info(`🚀 Video processing server running on port ${PORT}`);
   logger.info(`📁 Storage: ${migrationConfig.storage.targetBucket}/${migrationConfig.storage.targetFolder}`);
   logger.info(`🎬 FFmpeg ready for video processing`);
