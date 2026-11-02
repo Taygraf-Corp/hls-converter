@@ -208,9 +208,10 @@ const PRIVATE_SOURCE_BUCKET = 'unfiltered';
 
 /**
  * Decide whether a source object may be converted. HLS output always lands in
- * the public bucket, so a private object may only be converted when it is the
- * media of a single-item post shown in the General Feed only (channel
- * 'standard'). A post that is also in Unfiltered keeps its media private.
+ * the public bucket, so a private object may only be converted onto the post
+ * whose own single-item media it is (General Feed, Unfiltered or both: product
+ * decision 2026-11-02, the HLS copy is public by link). Carousels are refused:
+ * posts.hls_url can only describe one item.
  * Returns a refusal reason, or null when the request is allowed.
  */
 async function checkSourceAllowed(
@@ -246,9 +247,6 @@ async function checkSourceAllowed(
   }
   if (post.media_bucket !== bucket || post.media_path !== videoPath) {
     return 'videoPath is not this post\'s media';
-  }
-  if (post.in_general_feed !== true || post.channel !== 'standard') {
-    return 'only General Feed-only posts are converted; Unfiltered media stays private';
   }
   if ((post.media_count ?? 1) !== 1) {
     return 'carousel posts are not converted';

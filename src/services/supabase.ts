@@ -34,13 +34,11 @@ export class SupabaseStorageService {
     media_bucket: string | null;
     media_path: string | null;
     media_count: number | null;
-    in_general_feed: boolean | null;
-    channel: string | null;
     video_url: string | null;
   } | null> {
     const { data, error } = await this.adminClient
       .from('posts')
-      .select('media_bucket, media_path, media_count, in_general_feed, channel, video_url')
+      .select('media_bucket, media_path, media_count, video_url')
       .eq('id', postId)
       .maybeSingle();
 
