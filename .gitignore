@@ -93,3 +93,11 @@ jest.config.js
 # Temporary folders
 .tmp/
 .temp/
+
+# --- Secrets / signing artifacts (chore/production-safety-foundation) ---
+# Defensive: keep credentials and keystores out of the repo. (.env* already ignored above.)
+*.jks
+*.keystore
+key.properties
+*accessKeys*.csv
+service-account.json
