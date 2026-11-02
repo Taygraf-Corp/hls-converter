@@ -101,3 +101,4 @@ jest.config.js
 key.properties
 *accessKeys*.csv
 service-account.json
+__pycache__/

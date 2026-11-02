@@ -5,10 +5,11 @@ name: CI
 # Validates that both the service (src/) and the AWS CDK infra (infra/) typecheck
 # cleanly before a change can be merged. This does NOT build a Docker image, deploy,
 # or touch AWS in any way — it is a static gate only. Production deployment remains
-# governed entirely by the existing deploy.yml workflow (unchanged).
+# governed by deploy.yml, which is manual-only.
 #
-# No unit tests exist in this repository yet; adding a test framework is intentionally
-# out of scope for this change, so no test step is run here.
+# Tests (node:test, `npm test`) cover the HLS policy and the conversion/revoke
+# routes against an in-memory Supabase stand-in with the bundled ffmpeg. They
+# make no network calls.
 
 on:
   pull_request:
@@ -37,6 +38,12 @@ jobs:
 
       - name: Typecheck service (tsc --noEmit)
         run: npx tsc --noEmit
+
+      - name: Unit and route tests
+        run: npm test
+
+      - name: Backfill script tests (offline)
+        run: python3 -m unittest tests/test_backfill_hls.py
 
       - name: Install dependencies (infra / CDK)
         run: npm ci

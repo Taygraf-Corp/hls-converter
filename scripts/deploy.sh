@@ -54,7 +54,7 @@ check_prerequisites() {
 get_aws_info() {
     AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
     AWS_REGION=${AWS_REGION:-$(aws configure get region)}
-    AWS_REGION=${AWS_REGION:-us-east-1}
+    AWS_REGION=${AWS_REGION:-ca-central-1}  # production region
     
     echo -e "${BLUE}AWS Configuration:${NC}"
     echo "  Account ID: $AWS_ACCOUNT_ID"
@@ -92,8 +92,10 @@ deploy_infrastructure() {
         npm install
     fi
     
-    # Deploy (env vars loaded automatically from ../.env)
-    npx cdk deploy --require-approval never
+    # Review first; the deploy asks before any security-relevant change.
+    # The stack needs the running image digest: -c imageDigest=sha256:...
+    npx cdk diff "$@"
+    npx cdk deploy --require-approval broadening "$@"
     
     cd ..
     echo -e "${GREEN}✓ Infrastructure deployed${NC}"
@@ -188,50 +190,33 @@ show_outputs() {
 }
 
 # Main
-main() {
-    check_prerequisites
-    get_aws_info
-    install_dependencies
-    bootstrap_cdk
-    deploy_infrastructure
-    build_and_push
-    update_service
-    wait_for_deployment
-    show_outputs
-}
-
-# Parse arguments
+# The old full / image-only paths pushed and deployed the mutable `latest` tag
+# with --force-new-deployment. Image rollouts now go through the pinned script,
+# which keeps the current task definition and records a rollback target
+# (CTO review 2026-11-02, finding 4).
 case "${1:-}" in
     --infra-only)
+        shift
         check_prerequisites
         get_aws_info
         install_dependencies
         bootstrap_cdk
-        deploy_infrastructure
+        deploy_infrastructure "$@"
         ;;
-    --image-only)
-        check_prerequisites
-        get_aws_info
-        build_and_push
-        update_service
-        wait_for_deployment
-        show_outputs
+    --image-only|"")
+        shift || true
+        exec "$(dirname "$0")/deploy-image-pinned.sh" "$@"
         ;;
     --help|-h)
-        echo "Usage: ./scripts/deploy.sh [options]"
+        echo "Usage: ./scripts/deploy.sh [--image-only [--plan|--apply|--rollback <arn>]] | --infra-only -c imageDigest=sha256:..."
         echo ""
-        echo "Options:"
-        echo "  --infra-only   Deploy only infrastructure (CDK)"
-        echo "  --image-only   Build and push Docker image only"
-        echo "  --help         Show this help message"
+        echo "  --image-only   Pinned image rollout (scripts/deploy-image-pinned.sh); default"
+        echo "  --infra-only   CDK diff + deploy; needs -c imageDigest=sha256:<running digest>"
         echo ""
-        echo "Environment variables:"
-        echo "  AWS_REGION          AWS region (default: us-east-1)"
-        echo "  SUPABASE_URL        Supabase project URL"
-        echo "  SUPABASE_ANON_KEY   Supabase anonymous key"
-        echo "  API_KEY             API key for authentication"
+        echo "Environment: AWS_REGION (default ca-central-1)"
         ;;
     *)
-        main
+        echo "unknown option: $1 (see --help)" >&2
+        exit 2
         ;;
 esac
