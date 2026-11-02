@@ -42,8 +42,8 @@ jobs:
       - name: Unit and route tests
         run: npm test
 
-      - name: Backfill script tests (offline)
-        run: python3 -m unittest tests/test_backfill_hls.py
+      - name: Backfill and deploy-script tests (offline, fake AWS)
+        run: python3 -m unittest tests/test_backfill_hls.py tests/test_deploy_pinned.py
 
       - name: Install dependencies (infra / CDK)
         run: npm ci

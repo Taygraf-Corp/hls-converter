@@ -85,7 +85,7 @@ class BackfillTest(unittest.TestCase):
         code, _ = run(f, "--apply", "--checkpoint", self.cp)
         self.assertEqual(code, 0)
         self.assertEqual(seen, [["attempt"]])
-        self.assertEqual([r["event"] for r in self.records()], ["attempt", "done"])
+        self.assertEqual([r["event"] for r in self.records()], ["attempt", "reported", "done"])
 
     def test_timeout_stops_the_run_and_exits_nonzero(self):
         f = Fake([cand(A), cand(B), cand(C)], {
@@ -131,7 +131,8 @@ class BackfillTest(unittest.TestCase):
         code, _ = run(f, "--apply", "--checkpoint", self.cp)
         self.assertEqual(code, 0)
         self.assertEqual([p for _, p in f.sent], [B])
-        self.assertEqual(self.records()[-3]["via"], "reconciled")
+        self.assertIn({"id": A, "via": "reconciled"},
+                      [{k: r.get(k) for k in ("id", "via")} for r in self.records()])
 
     def test_old_unsettled_ids_resubmit_only_when_asked(self):
         with open(self.cp, "w") as fh:
@@ -146,6 +147,46 @@ class BackfillTest(unittest.TestCase):
         code, out = run(f, "--apply", "--checkpoint", self.cp)
         self.assertEqual(code, 1)
         self.assertIn("NOT VERIFIED", out)
+
+    def test_r7_an_unverified_success_is_never_marked_done(self):
+        # Run 1: the converter answers 200 but HLS is not in the database.
+        code, out = run(Fake([cand(A)], {A: (200, {"success": True}, False)}),
+                        "--apply", "--checkpoint", self.cp)
+        self.assertEqual(code, 1)
+        self.assertNotIn("done", [r["event"] for r in self.records()])
+        self.assertEqual(self.records()[-1]["event"], "unverified")
+        # Run 2, same checkpoint: it does not skip the post or exit 0.
+        f = Fake([cand(A)], {A: (200, {"success": True}, True)}, hls={A: False})
+        code, out = run(f, "--apply", "--checkpoint", self.cp)
+        self.assertIn("unsettled", str(code))
+        self.assertEqual(f.sent, [])
+        # Asked to resubmit: sent at once (the first request had finished),
+        # verified, and only then done.
+        code, out = run(f, "--apply", "--checkpoint", self.cp, "--resubmit-unsettled")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([p for _, p in f.sent], [A])
+        self.assertEqual(self.records()[-1]["event"], "done")
+
+    def test_r7_a_verification_that_cannot_run_leaves_the_id_unsettled(self):
+        f = Fake([cand(A)], {A: (200, {"success": True}, True)})
+        calls = {"n": 0}
+        orig = f.query
+        def query(sql):
+            if "own_hls" in sql:
+                calls["n"] += 1
+                raise SystemExit("query failed: 503")
+            return orig(sql)
+        f.query = query
+        code, out = run(f, "--apply", "--checkpoint", self.cp)
+        self.assertEqual(code, 1)
+        self.assertIn("VERIFICATION COULD NOT RUN", out)
+        self.assertEqual(self.records()[-1]["event"], "reported")
+        # Next run: verifies first, finds HLS, settles it, sends nothing.
+        f2 = Fake([cand(A)], {}, hls={A: True})
+        code, out = run(f2, "--apply", "--checkpoint", self.cp)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(f2.sent, [])
+        self.assertEqual(self.records()[-1]["event"], "done")
 
     def test_exclude_file(self):
         ex = os.path.join(self.dir, "ex.txt")

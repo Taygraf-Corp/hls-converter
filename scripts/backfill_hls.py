@@ -41,8 +41,14 @@ Safety (CTO review 2026-11-02, finding 6):
     first: settled ones are skipped; unsettled ones block the run unless
     --resubmit-unsettled is given AND they were attempted more than
     --settle-minutes ago.
-  * After a run, every id the converter reported as done is verified in the
-    database; any mismatch makes the exit status non-zero.
+  * An id is only marked done after the database confirms it (hls_url on the
+    post's own folder, or gone for --sweep). A failed or impossible check leaves
+    it unsettled and the exit status non-zero; the next run re-checks it and
+    resends it only with --resubmit-unsettled (no wait: the converter answered,
+    so that request had finished).
+  * Duplicates are harmless by construction (hls-converter#2): each attempt
+    writes its own folder and only the first to finish publishes; the waits
+    above only avoid wasted work.
 
 Output never prints full post ids or paths (only the first 8 characters).
 """
@@ -136,6 +142,11 @@ from public.posts p where p.id::text = any (array[{ids}])
 """
 
 UNCERTAIN = "uncertain"
+# Events that leave an id unsettled. "attempt"/UNCERTAIN: no answer, the
+# converter may still be working. "reported": the converter answered done but
+# the database check has not run. "unverified": it ran and HLS is not there.
+UNSETTLED = ("attempt", UNCERTAIN, "reported", "unverified")
+ANSWERED = ("reported", "unverified")
 
 
 def now_iso():
@@ -179,9 +190,10 @@ def post_json(route, payload, api_key, timeout):
 
 
 def classify(mode, status, body):
-    """'done', 'refused' (the converter said no; safe, not retried) or UNCERTAIN."""
+    """'reported' (the converter says done; not settled until verified in the
+    database), 'refused' (the converter said no; safe, not retried) or UNCERTAIN."""
     if status == 200 and body.get("success") is True:
-        return "done"
+        return "reported"
     if status in (403, 409):
         return "refused"
     return UNCERTAIN  # 0 (timeout/connection), 400, 5xx, or a 200 without success
@@ -211,7 +223,9 @@ class Checkpoint:
         self.last[rec["id"]] = rec
 
     def unsettled(self):
-        return {i: r for i, r in self.last.items() if r["event"] in ("attempt", UNCERTAIN)}
+        """Ids not known to be finished: in flight or uncertain (the converter may
+        still be working), or reported done but not (yet) verified."""
+        return {i: r for i, r in self.last.items() if r["event"] in UNSETTLED}
 
 
 def short(s):
@@ -243,7 +257,18 @@ def reconcile(cp, mode, a):
             # Row gone or hls_url cleared: the revoke finished, or the next sweep
             # dry run will list the folder again.
             cp.write({"id": pid, "event": "done", "via": "reconciled"})
+        elif rec["event"] in ANSWERED:
+            # The converter answered, so that request has finished; its result
+            # is just not in the database. Safe to send again when asked.
+            cp.write({"id": pid, "event": "unverified", "via": "reconciled"})
+            if a.resubmit_unsettled:
+                resubmit.add(pid)
+            else:
+                blocked.append((pid, None))
         else:
+            # No answer: the converter may still be working. A duplicate would
+            # be harmless (attempts use separate folders and only the first to
+            # finish publishes), but it is only sent when asked, after a pause.
             age = (dt.datetime.now(dt.timezone.utc)
                    - dt.datetime.strptime(rec["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc))
             if a.resubmit_unsettled and age.total_seconds() >= a.settle_minutes * 60:
@@ -251,9 +276,12 @@ def reconcile(cp, mode, a):
             else:
                 blocked.append((pid, int(age.total_seconds() // 60)))
     if blocked:
-        print("UNSETTLED from an earlier run (the converter may still be working on them):")
+        print("UNSETTLED from an earlier run:")
         for pid, mins in blocked:
-            print(f"  post {short(pid)}…  attempted {mins} min ago")
+            if mins is None:
+                print(f"  post {short(pid)}…  converter answered done, but HLS is not in the database")
+            else:
+                print(f"  post {short(pid)}…  no answer, attempted {mins} min ago (may still be running)")
         sys.exit(f"stopping: {len(blocked)} unsettled id(s). Check the converter logs; re-run with "
                  f"--resubmit-unsettled once they are older than --settle-minutes ({a.settle_minutes}).")
     return resubmit
@@ -334,7 +362,7 @@ def main():
         results[outcome] = results.get(outcome, 0) + 1
         msg = str(body.get("error", ""))[:100]
         print(f"[{i}/{len(rows)}] {r['g']:24} post {short(r['id'])}…  -> {status or 'no answer'} {outcome} {msg}")
-        if outcome == "done":
+        if outcome == "reported":
             done.append(r["id"])
         if outcome == UNCERTAIN:
             stopped = r["id"]
@@ -342,16 +370,26 @@ def main():
         time.sleep(a.pause)
     print(f"outcomes: {results}")
 
+    # Only the database check settles an id (CTO re-review R7): "done" is
+    # written after it, a failed check leaves the id unsettled ("unverified"),
+    # and a check that cannot run leaves it "reported" for the next run.
     failed = []
-    state = verify_rows(done)
+    try:
+        state = verify_rows(done)
+    except BaseException as e:  # noqa: B902 - includes the SystemExit of a failed query
+        print(f"VERIFICATION COULD NOT RUN ({type(e).__name__}): {len(done)} id(s) stay unsettled "
+              f"in {a.checkpoint}; the next run verifies them first.")
+        return 1
     for pid in done:
         row = state.get(pid)
         ok = (row is not None and row["own_hls"]) if mode == "convert" else (row is None or not row["has_hls"])
+        cp.write({"id": pid, "event": "done" if ok else "unverified"})
         if not ok:
             failed.append(pid)
     print(f"verified: {len(done) - len(failed)}/{len(done)} reported done are done in the database")
     for pid in failed:
-        print(f"  NOT VERIFIED: post {short(pid)}…")
+        print(f"  NOT VERIFIED: post {short(pid)}… (left unsettled; the next run blocks on it "
+              "until it is reconciled or --resubmit-unsettled is given)")
 
     if stopped:
         print(f"STOPPED on an uncertain outcome for post {short(stopped)}…. It stays unsettled in "
