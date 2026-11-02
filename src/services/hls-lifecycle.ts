@@ -16,6 +16,8 @@
  *      (hls_reconcile_queue, filled by triggers on delete / policy changes /
  *      account deletion and by a periodic scan), with retries and backoff.
  *      Private media is only converted while that queue is being drained.
+ * Third review: stale cleanup leaves a folder alone while another post
+ *      still plays HLS from it.
  */
 import path from 'path';
 import { logger } from '../utils/logger.js';
@@ -238,9 +240,16 @@ export class HlsLifecycle {
       if (r.kept) logger.warn(`Reconcile kept a folder: ${r.kept}`);
       return { removed: r.removed };
     }
+    const folder = this.folderOf(postId);
+    // Another post may still play an older rendition from this folder; then
+    // nothing in it is stale for this post to prune.
+    if (await this.store.otherPostUsesFolder(postId, folder)) {
+      logger.warn('Reconcile kept a folder: another post plays HLS from this folder');
+      return { removed: 0 };
+    }
     const post = await this.store.getPostForHls(postId);
     const keepDir = publishedDir(post?.hls_url ?? null, this.opts.bucket);
-    const objects = await this.store.listTree(this.folderOf(postId));
+    const objects = await this.store.listTree(folder);
     const stale = objects
       .filter(o => path.posix.dirname(o.path) !== keepDir)
       .filter(o => now - o.modifiedAt >= this.opts.staleMs)

@@ -531,6 +531,33 @@ test('R4: reconcile removes stale leftovers but keeps the published copy and att
   assert.deepEqual(hlsKeys(32), [...keep, `FlutterFlow/converted/${id(32)}/hls/v9999999999999-inflight/360p_000.ts`].sort());
 });
 
+test('reconcile never prunes HLS that another live post still plays', async () => {
+  // Third review: A stays eligible and is queued (e.g. UNFILTERED -> PUBLIC);
+  // B still plays an older rendition under A's folder.
+  seed(33);
+  assert.equal((await convert(33)).status, 200);
+  const current = hlsKeys(33);
+  const old = Date.now() - 2 * HOUR;
+  const bDir = `converted/${id(33)}/hls/v0000000000002-sharedbb`;
+  const bFiles = [`FlutterFlow/${bDir}/master.m3u8`, `FlutterFlow/${bDir}/360p_000.ts`];
+  for (const k of bFiles) objects.set(k, { data: Buffer.from('x'), modifiedAt: old });
+  const stray = `FlutterFlow/converted/${id(33)}/hls/v0000000000003-strayccc/360p_000.ts`;
+  objects.set(stray, { data: Buffer.from('x'), modifiedAt: old });
+  const b = seed(34, { hls_url: `${BASE}${bDir}/master.m3u8` });
+
+  enqueue(33);
+  await until(() => !queue.has(id(33)), 'queue entry completed');
+  for (const k of [...current, ...bFiles]) assert.ok(objects.has(k), `kept ${k}`);
+  assert.equal(b.hls_url, `${BASE}${bDir}/master.m3u8`);
+
+  // Once nothing else plays from the folder, unreferenced stale files go.
+  b.hls_url = null;
+  enqueue(33);
+  await until(() => !queue.has(id(33)), 'second queue entry completed');
+  assert.deepEqual(hlsKeys(33), current);
+  assert.equal(objects.has(stray), false);
+});
+
 test('a legacy public post converts only from its own video_url', async () => {
   const row = seed(40, {
     media_bucket: null, media_path: null, media_count: 1, post_type: 'video',
