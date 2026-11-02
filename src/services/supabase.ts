@@ -27,6 +27,29 @@ export class SupabaseStorageService {
     );
   }
 
+  /**
+   * Read the media fields of one post (service role). Null when no row matches.
+   */
+  async getPostMedia(postId: string): Promise<{
+    media_bucket: string | null;
+    media_path: string | null;
+    media_count: number | null;
+    in_general_feed: boolean | null;
+    channel: string | null;
+    video_url: string | null;
+  } | null> {
+    const { data, error } = await this.adminClient
+      .from('posts')
+      .select('media_bucket, media_path, media_count, in_general_feed, channel, video_url')
+      .eq('id', postId)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to read post ${postId}: ${error.message}`);
+    }
+    return data;
+  }
+
   async updatePost(postId: string, data: any): Promise<void> {
     const { data: result, error } = await this.adminClient
       .from('posts')

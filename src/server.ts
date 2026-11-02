@@ -201,6 +201,74 @@ async function processVideo(
   }
 }
 
+/** Public source bucket: legacy Standard posts and multi-account uploads. */
+const PUBLIC_SOURCE_BUCKET = 'FlutterFlow';
+/** Private bucket of the unified composer (taygram #101). */
+const PRIVATE_SOURCE_BUCKET = 'unfiltered';
+
+/**
+ * Decide whether a source object may be converted. HLS output always lands in
+ * the public bucket, so a private object may only be converted when it is the
+ * media of a single-item post shown in the General Feed only (channel
+ * 'standard'). A post that is also in Unfiltered keeps its media private.
+ * Returns a refusal reason, or null when the request is allowed.
+ */
+async function checkSourceAllowed(
+  bucket: string,
+  videoPath: string,
+  postId?: string,
+  videoId?: string
+): Promise<string | null> {
+  if (bucket === PUBLIC_SOURCE_BUCKET) {
+    // A public file may be converted, but it may only be written onto the post
+    // whose own video it is.
+    if (!postId) {
+      return null;
+    }
+    const post = await storageService.getPostMedia(postId);
+    if (!post) {
+      return 'post not found';
+    }
+    if (!sameObject(post.video_url, bucket, videoPath)) {
+      return 'videoPath is not this post\'s video';
+    }
+    return null;
+  }
+  if (bucket !== PRIVATE_SOURCE_BUCKET) {
+    return `bucket ${bucket} is not a conversion source`;
+  }
+  if (!postId || (videoId && videoId !== postId)) {
+    return 'private media needs a postId, and videoId must equal it';
+  }
+  const post = await storageService.getPostMedia(postId);
+  if (!post) {
+    return 'post not found';
+  }
+  if (post.media_bucket !== bucket || post.media_path !== videoPath) {
+    return 'videoPath is not this post\'s media';
+  }
+  if (post.in_general_feed !== true || post.channel !== 'standard') {
+    return 'only General Feed-only posts are converted; Unfiltered media stays private';
+  }
+  if ((post.media_count ?? 1) !== 1) {
+    return 'carousel posts are not converted';
+  }
+  return null;
+}
+
+/** Whether a public object URL names bucket/objectPath (URL-encoding ignored). */
+function sameObject(url: string | null, bucket: string, objectPath: string): boolean {
+  if (!url) {
+    return false;
+  }
+  try {
+    const pathname = decodeURIComponent(new URL(url).pathname);
+    return pathname.endsWith(`/storage/v1/object/public/${bucket}/${objectPath}`);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Build storage path
  * Structure: converted/{filename}/hls
@@ -436,6 +504,12 @@ app.post('/api/process-from-storage', authenticate, express.json(), async (req: 
       size: 0,
       bucket: bucket || migrationConfig.storage.sourceBucket
     };
+
+    const refusal = await checkSourceAllowed(videoFile.bucket, videoPath, postId, videoId);
+    if (refusal) {
+      logger.warn(`Refused process-from-storage for ${videoFile.bucket}/${videoPath}: ${refusal}`);
+      return res.status(403).json({ success: false, error: refusal });
+    }
 
     logger.info(`Processing from storage: ${videoPath}`);
 
