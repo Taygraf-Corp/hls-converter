@@ -53,6 +53,10 @@ const faults = {
   hangRenew: new Set<string>(),
   /** post ids whose HLS uploads never get an answer, but are stored anyway once the client gives up */
   hangUpload: new Set<string>(),
+  /** the next N claim requests never get an answer */
+  hangClaims: 0,
+  /** post ids whose result recording never gets an answer */
+  hangResult: new Set<string>(),
 };
 /** hls_claim_autoconvert stand-in: posts the database would offer, and the recorded results. */
 const auto = {
@@ -70,6 +74,9 @@ const auto = {
   renewAborted: 0,
   /** uploads stored after the client had given up on them */
   lateWrites: 0,
+  /** hung claim / result requests the client gave up on */
+  claimAborted: 0,
+  resultAborted: 0,
 };
 const sent: { patches: string[] } = { patches: [] };
 
@@ -181,6 +188,12 @@ const mock = http.createServer(async (req, res) => {
       case 'hls_claim_autoconvert': {
         if (faults.autoMissing) return send(404, { code: 'PGRST202', message: 'Could not find the function public.hls_claim_autoconvert' });
         if ('p_limit' in args) return send(400, { message: 'mock: a claim is one post (no p_limit)' });
+        if (faults.hangClaims > 0) {
+          faults.hangClaims--;
+          auto.events.push('claim hung');
+          res.on('close', () => { auto.claimAborted++; });
+          return; // never answered
+        }
         auto.claims++;
         const p = auto.offer.shift();
         if (!p) return send(200, []);
@@ -202,6 +215,11 @@ const mock = http.createServer(async (req, res) => {
         return send(200, ok);
       }
       case 'hls_autoconvert_result': {
+        if (faults.hangResult.has(args.p_post_id)) {
+          auto.events.push(`result ${args.p_post_id} hung`);
+          res.on('close', () => { auto.resultAborted++; });
+          return; // never answered
+        }
         const ok = auto.tokens.get(args.p_post_id) === args.p_claim_token && !auto.lostClaims.has(args.p_post_id);
         auto.events.push(`result ${args.p_post_id} ${ok}`);
         if (ok) {
@@ -819,4 +837,31 @@ test('health reports the auto-convert state for rollback checks', async () => {
   const h = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
   assert.deepEqual(Object.keys(h.autoConvert).sort(), ['background', 'state']);
   assert.ok(['idle', 'working'].includes(h.autoConvert.state));
+});
+
+test('auto-convert round 3: a claim request that never answers is given up and later scans recover', async () => {
+  seed(64);
+  faults.hangClaims = 2;
+  auto.offer.push(id(64));
+  await until(() => auto.claimAborted >= 2, 'both hung claims given up (0.25 s limit each)', 3000);
+  await until(() => auto.results.has(id(64)), 'a later scan claims and converts the post', 5000);
+  assert.deepEqual(auto.results.get(id(64)), { error: null, final: false });
+  assert.ok(posts.get(id(64))!.hls_url);
+});
+
+test('auto-convert round 3: a result request that never answers is given up and later scans recover', async () => {
+  const row = seed(65);
+  seed(66);
+  faults.hangResult.add(id(65));
+  auto.offer.push(id(65), id(66));
+  await until(() => auto.events.includes(`result ${id(65)} hung`), 'the result request hangs', 5000);
+  const hungAt = Date.now();
+  await until(() => auto.resultAborted >= 1, 'the hung result request given up', 3000);
+  await until(() => auto.results.has(id(66)), 'the next post claimed and converted', 5000);
+  assert.ok(Date.now() - hungAt < 3000, 'the worker was not held by the hung response');
+  assert.ok(row.hls_url, 'the conversion itself succeeded; only its record was lost (the lease lapses)');
+  faults.hangResult.clear();
+  await until(() => auto.offer.length === 0, 'nothing waiting', 1000);
+  const h = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+  assert.equal(h.autoConvert.background, 0);
 });

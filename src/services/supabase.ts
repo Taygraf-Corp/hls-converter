@@ -233,9 +233,15 @@ export class SupabaseStorageService {
     }
   }
 
-  /** One recent video post without HLS to convert now, under a lease (hls_claim_autoconvert). */
-  async claimAutoconvert(leaseMs: number): Promise<{ post_id: string; attempts: number; claim_token: string } | null> {
-    const { data, error } = await this.adminClient.rpc('hls_claim_autoconvert', { p_lease: intervalOf(leaseMs) });
+  /**
+   * One recent video post without HLS to convert now, under a lease
+   * (hls_claim_autoconvert). The request is aborted after [timeoutMs] (CTO
+   * review round 3); a claim the database made but whose answer was lost
+   * simply lets its lease lapse.
+   */
+  async claimAutoconvert(leaseMs: number, timeoutMs: number): Promise<{ post_id: string; attempts: number; claim_token: string } | null> {
+    const { data, error } = await this.adminClient.rpc('hls_claim_autoconvert', { p_lease: intervalOf(leaseMs) })
+      .abortSignal(AbortSignal.timeout(timeoutMs));
     if (error) {
       throw new Error(`Failed to claim auto-convert work: ${error.message}`);
     }
@@ -257,11 +263,15 @@ export class SupabaseStorageService {
     return data === true;
   }
 
-  /** Record the outcome and release the claim; false when it was not this worker's. */
-  async autoconvertResult(postId: string, token: string, message: string | null, final: boolean): Promise<boolean> {
+  /**
+   * Record the outcome and release the claim; false when it was not this
+   * worker's. The request is aborted after [timeoutMs] (CTO review round 3);
+   * an unrecorded result lets the lease lapse.
+   */
+  async autoconvertResult(postId: string, token: string, message: string | null, final: boolean, timeoutMs: number): Promise<boolean> {
     const { data, error } = await this.adminClient.rpc('hls_autoconvert_result', {
       p_post_id: postId, p_claim_token: token, p_error: message, p_final: final,
-    });
+    }).abortSignal(AbortSignal.timeout(timeoutMs));
     if (error) {
       throw new Error(`Failed to record an auto-convert result: ${error.message}`);
     }

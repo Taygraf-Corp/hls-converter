@@ -32,6 +32,11 @@
  * for a claim that is no longer current. A worker that lost its claim records
  * nothing.
  *
+ * Every call to the database outside an attempt (claim, renewal, result) is
+ * aborted after L/8 (CTO review round 3), so a hung response can never hold
+ * up later scans: a claim whose answer was lost, or an unrecorded result,
+ * only lets that lease lapse.
+ *
  *  - Runs only while the revocation queue is healthy and never overlaps itself.
  *  - Missing functions (the SQL not applied yet) only log; nothing else changes.
  *  - HLS_AUTOCONVERT_INTERVAL_MS=0 (the default) turns it off.
@@ -49,12 +54,12 @@ export interface AutoConvertClaim {
 
 export interface AutoConvertStore {
   getPostForHls(postId: string): Promise<PostRow | null>;
-  /** One post to convert now under a lease of [leaseMs], or null. */
-  claimAutoconvert(leaseMs: number): Promise<AutoConvertClaim | null>;
+  /** One post to convert now under a lease of [leaseMs], or null. The request ends after [timeoutMs]. */
+  claimAutoconvert(leaseMs: number, timeoutMs: number): Promise<AutoConvertClaim | null>;
   /** False: the claim is no longer this worker's. The request ends after [timeoutMs]. */
   renewAutoconvert(postId: string, token: string, leaseMs: number, timeoutMs: number): Promise<boolean>;
-  /** Records the outcome and releases the claim. False: not this worker's claim. */
-  autoconvertResult(postId: string, token: string, error: string | null, final: boolean): Promise<boolean>;
+  /** Records the outcome and releases the claim. False: not this worker's claim. The request ends after [timeoutMs]. */
+  autoconvertResult(postId: string, token: string, error: string | null, final: boolean, timeoutMs: number): Promise<boolean>;
 }
 
 /** Converts one post's own video; the route's conversion path. */
@@ -127,7 +132,7 @@ export class HlsAutoConvert {
     const L = Math.max(1, this.opts.leaseMs);
     return {
       renewEveryMs: Math.max(1, Math.floor(L / 4)),
-      renewTimeoutMs: Math.max(1, Math.floor(L / 8)),
+      rpcTimeoutMs: Math.max(1, Math.floor(L / 8)),
       unconfirmedMs: Math.floor(L / 2),
       stopGraceMs: Math.max(1, Math.floor(L / 4)),
       watchEveryMs: Math.max(10, Math.min(1000, Math.floor(L / 20))),
@@ -146,7 +151,7 @@ export class HlsAutoConvert {
         const sentAt = Date.now();
         let claim: AutoConvertClaim | null;
         try {
-          claim = await this.store.claimAutoconvert(this.opts.leaseMs);
+          claim = await this.store.claimAutoconvert(this.opts.leaseMs, this.lease.rpcTimeoutMs);
         } catch (error) {
           logger.warn(`Auto-convert unavailable: ${errorText(error)}`);
           break;
@@ -185,7 +190,7 @@ export class HlsAutoConvert {
       if (renewing || lost) return;
       renewing = true;
       const sentAt = Date.now();
-      this.store.renewAutoconvert(postId, token, this.opts.leaseMs, t.renewTimeoutMs).then(
+      this.store.renewAutoconvert(postId, token, this.opts.leaseMs, t.rpcTimeoutMs).then(
         ok => {
           if (ok) confirmedAt = Math.max(confirmedAt, sentAt);
           else cancel('the claim is no longer ours', true);
@@ -226,7 +231,7 @@ export class HlsAutoConvert {
       logger.warn(`Auto-convert attempt ${claim.attempts} ${result.final ? 'refused' : 'failed'}: ${result.error}`);
     }
     try {
-      const recorded = await this.store.autoconvertResult(postId, token, result.error, result.final);
+      const recorded = await this.store.autoconvertResult(postId, token, result.error, result.final, t.rpcTimeoutMs);
       if (!recorded) logger.warn('Auto-convert result ignored: the claim is no longer ours');
     } catch (e) {
       logger.error(`Auto-convert result not recorded (the lease will run out): ${errorText(e)}`);
