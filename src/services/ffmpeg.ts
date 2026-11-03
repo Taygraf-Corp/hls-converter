@@ -192,7 +192,8 @@ export class FFmpegService {
     inputPath: string,
     outputDir: string,
     options: ConversionOptions,
-    onProgress?: (progress: number) => void
+    onProgress?: (progress: number) => void,
+    signal?: AbortSignal
   ): Promise<string[]> {
     try {
       // Ensure output directory exists
@@ -220,7 +221,8 @@ export class FFmpegService {
           path.join(outputDir, segmentPattern),
           resolution,
           options,
-          onProgress ? (p) => onProgress((i + p / 100) / options.resolutions.length * 100) : undefined
+          onProgress ? (p) => onProgress((i + p / 100) / options.resolutions.length * 100) : undefined,
+          signal
         );
         
         outputFiles.push(variantPlaylist);
@@ -422,9 +424,14 @@ export class FFmpegService {
     segmentPattern: string,
     resolution: Resolution,
     options: ConversionOptions,
-    onProgress?: (progress: number) => void
+    onProgress?: (progress: number) => void,
+    signal?: AbortSignal
   ): Promise<void> {
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(cancelledError(signal));
+        return;
+      }
       const command = ffmpeg(inputPath)
         .outputOptions([
           '-c:v', 'libx264',
@@ -462,13 +469,25 @@ export class FFmpegService {
         logger.debug('FFmpeg stderr:', stderrLine);
       });
 
+      // Cancellation (auto-convert timeout or lost claim) kills ffmpeg at once.
+      let cancelled = false;
+      const onAbort = () => {
+        cancelled = true;
+        command.kill('SIGKILL');
+        reject(cancelledError(signal!));
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+
       command
         .output(playlistPath)
         .on('end', () => {
+          signal?.removeEventListener('abort', onAbort);
           logger.debug(`Variant stream created: ${playlistPath}`);
           resolve();
         })
         .on('error', (error, stdout, stderr) => {
+          signal?.removeEventListener('abort', onAbort);
+          if (cancelled) return;
           logger.error(`Error creating variant stream ${playlistPath}:`, error);
           logger.error('FFmpeg stdout:', stdout);
           logger.error('FFmpeg stderr:', stderr);
@@ -562,4 +581,10 @@ export class FFmpegService {
       return false;
     }
   }
+}
+
+/** The error a cancelled conversion fails with. */
+export function cancelledError(signal: AbortSignal): Error {
+  const reason = signal.reason;
+  return new Error(`conversion cancelled: ${reason instanceof Error ? reason.message : String(reason ?? 'aborted')}`);
 }

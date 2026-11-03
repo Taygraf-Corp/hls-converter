@@ -47,9 +47,22 @@ const faults = {
   queueDown: false,
   /** the auto-convert functions do not exist (backend SQL not applied) */
   autoMissing: false,
+  /** "<bucket>/<path>" -> delay storage reads of that object by this many ms */
+  slowGet: new Map<string, number>(),
 };
 /** hls_claim_autoconvert stand-in: posts the database would offer, and the recorded results. */
-const auto = { offer: [] as string[], attempts: new Map<string, number>(), results: new Map<string, { error: string | null; final: boolean }>(), claims: 0, calls: 0 };
+const auto = {
+  offer: [] as string[],
+  attempts: new Map<string, number>(),
+  /** the current claim token per post; renew and result must name it */
+  tokens: new Map<string, string>(),
+  /** posts whose claim another task has taken over: renewals are refused */
+  lostClaims: new Set<string>(),
+  results: new Map<string, { error: string | null; final: boolean }>(),
+  /** claim/renew/result calls in order, e.g. "claim <id>" */
+  events: [] as string[],
+  claims: 0, calls: 0,
+};
 const sent: { patches: string[] } = { patches: [] };
 
 function privPost(n: number, over: Row = {}): Row {
@@ -159,17 +172,31 @@ const mock = http.createServer(async (req, res) => {
         return send(200, 0);
       case 'hls_claim_autoconvert': {
         if (faults.autoMissing) return send(404, { code: 'PGRST202', message: 'Could not find the function public.hls_claim_autoconvert' });
+        if ('p_limit' in args) return send(400, { message: 'mock: a claim is one post (no p_limit)' });
         auto.claims++;
-        const picked = auto.offer.splice(0, args.p_limit);
-        return send(200, picked.map(p => {
-          const n = (auto.attempts.get(p) ?? 0) + 1;
-          auto.attempts.set(p, n);
-          return { post_id: p, attempts: n };
-        }));
+        const p = auto.offer.shift();
+        if (!p) return send(200, []);
+        const n = (auto.attempts.get(p) ?? 0) + 1;
+        auto.attempts.set(p, n);
+        const token = `token-${p}-${n}`;
+        auto.tokens.set(p, token);
+        auto.events.push(`claim ${p}`);
+        return send(200, [{ post_id: p, attempts: n, claim_token: token, lease_until: new Date().toISOString() }]);
       }
-      case 'hls_autoconvert_result':
-        auto.results.set(args.p_post_id, { error: args.p_error, final: args.p_final });
-        return send(200, null);
+      case 'hls_autoconvert_renew': {
+        const ok = auto.tokens.get(args.p_post_id) === args.p_claim_token && !auto.lostClaims.has(args.p_post_id);
+        auto.events.push(`renew ${args.p_post_id} ${ok}`);
+        return send(200, ok);
+      }
+      case 'hls_autoconvert_result': {
+        const ok = auto.tokens.get(args.p_post_id) === args.p_claim_token && !auto.lostClaims.has(args.p_post_id);
+        auto.events.push(`result ${args.p_post_id} ${ok}`);
+        if (ok) {
+          auto.tokens.delete(args.p_post_id);
+          auto.results.set(args.p_post_id, { error: args.p_error, final: args.p_final });
+        }
+        return send(200, ok);
+      }
     }
   }
   if (u.pathname.startsWith('/storage/v1/object/list/')) {
@@ -205,6 +232,8 @@ const mock = http.createServer(async (req, res) => {
       return send(200, prefixes.map((p: string) => ({ name: p })));
     }
     if (req.method === 'GET') {
+      const delay = faults.slowGet.get(key);
+      if (delay) await sleep(delay);
       const o = objects.get(key);
       if (!o) return send(400, { statusCode: '404', error: 'not_found', message: 'Object not found' });
       res.statusCode = 200;
@@ -286,6 +315,7 @@ before(async () => {
       PUBLIC_STORAGE_BASE_URL: BASE, ENABLE_ADMIN_ROUTES: '', LOG_LEVEL: 'error',
       HLS_RECONCILE_INTERVAL_MS: '150', HLS_QUEUE_HEALTH_MS: '1000', HLS_STALE_MS: String(HOUR),
       HLS_AUTOCONVERT_INTERVAL_MS: '200', HLS_AUTOCONVERT_BATCH: '2',
+      HLS_AUTOCONVERT_LEASE_MS: '600', HLS_AUTOCONVERT_TIMEOUT_MS: '4000',
     },
     stdio: ['ignore', 'ignore', 'inherit'],
   });
@@ -638,6 +668,16 @@ test('auto-convert: new videos nobody asked HLS for are converted from their own
   assert.equal(done.hls_url, `${BASE}converted/${id(54)}/hls/vx/master.m3u8`);
   assert.deepEqual(hlsKeys(54), []);
   assert.deepEqual(auto.results.get(id(55)), { error: 'post not found', final: true });
+
+  // P1: each post is claimed only when its work starts, right after the
+  // previous post's result, so no post waits while holding a claim.
+  const mine = new Set([50, 51, 52, 53, 54, 55].map(id));
+  const seq = auto.events.filter(e => mine.has(e.split(' ')[1]) && !e.startsWith('renew'));
+  assert.equal(seq.length, 12, seq.join('\n'));
+  for (let i = 0; i < seq.length; i += 2) {
+    const p = seq[i].split(' ')[1];
+    assert.deepEqual([seq[i], seq[i + 1]], [`claim ${p}`, `result ${p} true`]);
+  }
 });
 
 test('auto-convert: without the backend functions or a healthy queue it does nothing, and the rest keeps working', async () => {
@@ -660,4 +700,45 @@ test('auto-convert: without the backend functions or a healthy queue it does not
   await until(() => auto.results.has(id(56)), 'converted once both are back', 30000);
   assert.deepEqual(auto.results.get(id(56)), { error: null, final: false });
   assert.ok(posts.get(id(56))!.hls_url);
+});
+
+test('auto-convert P1: a conversion that runs past the timeout is cancelled, ffmpeg is killed and nothing is published', async () => {
+  const longClip = path.join(tmp, 'long.mp4');
+  execFileSync(ffmpegInstaller.path, [
+    '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc=size=1280x720:rate=30',
+    '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '90', '-pix_fmt', 'yuv420p',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest', longClip,
+  ]);
+  const row = seed(57);
+  objects.set(`unfiltered/${row.media_path}`, { data: fs.readFileSync(longClip), modifiedAt: Date.now() });
+  const started = Date.now();
+  auto.offer.push(id(57));
+  await until(() => auto.results.has(id(57)), 'the timed-out attempt recorded', 30000);
+  const took = Date.now() - started;
+  assert.ok(took < 9000, `cancelled after about the 4 s timeout, took ${took} ms`);
+  assert.equal(auto.results.get(id(57))!.final, false, 'a timeout may be retried');
+  assert.match(auto.results.get(id(57))!.error!, /timed out after 4000 ms/);
+  assert.equal(row.hls_url, null);
+  await until(() => hlsKeys(57).length === 0, 'the attempt folder removed');
+  const work = path.join(tmp, 'work');
+  const ffmpegs = execFileSync('ps', ['-eo', 'args']).toString().split('\n').filter(l => l.includes('ffmpeg') && l.includes(work));
+  assert.deepEqual(ffmpegs, [], 'no ffmpeg left running');
+});
+
+test('auto-convert P1: a worker that loses its claim stops at once and records nothing', async () => {
+  const row = seed(58);
+  faults.slowGet.set(`unfiltered/${row.media_path}`, 3000);   // the download hangs
+  auto.lostClaims.add(id(58));                               // another task holds the claim now
+  seed(59);
+  auto.offer.push(id(58), id(59));
+  await until(() => auto.events.includes(`claim ${id(58)}`), 'claimed');
+  const claimedAt = Date.now();
+  await until(() => auto.results.has(id(59)), 'the next post converted', 10000);
+  assert.ok(Date.now() - claimedAt < 2800, 'the worker moved on before the download would have finished');
+  assert.ok(auto.events.includes(`renew ${id(58)} false`));
+  assert.ok(!auto.events.some(e => e.startsWith(`result ${id(58)}`)), 'no result for a claim that is not ours');
+  assert.equal(row.hls_url, null);
+  assert.deepEqual(hlsKeys(58), []);
+  assert.ok(posts.get(id(59))!.hls_url);
+  faults.slowGet.clear();
 });

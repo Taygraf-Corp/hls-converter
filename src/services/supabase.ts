@@ -228,22 +228,36 @@ export class SupabaseStorageService {
     }
   }
 
-  /** Recent video posts without HLS to convert now (hls_claim_autoconvert). */
-  async claimAutoconvert(limit: number): Promise<{ post_id: string; attempts: number }[]> {
-    const { data, error } = await this.adminClient.rpc('hls_claim_autoconvert', { p_limit: limit });
+  /** One recent video post without HLS to convert now, under a lease (hls_claim_autoconvert). */
+  async claimAutoconvert(leaseMs: number): Promise<{ post_id: string; attempts: number; claim_token: string } | null> {
+    const { data, error } = await this.adminClient.rpc('hls_claim_autoconvert', { p_lease: intervalOf(leaseMs) });
     if (error) {
       throw new Error(`Failed to claim auto-convert work: ${error.message}`);
     }
-    return (data ?? []) as { post_id: string; attempts: number }[];
+    const rows = (data ?? []) as { post_id: string; attempts: number; claim_token: string }[];
+    return rows[0] ?? null;
   }
 
-  async autoconvertResult(postId: string, message: string | null, final: boolean): Promise<void> {
-    const { error } = await this.adminClient.rpc('hls_autoconvert_result', {
-      p_post_id: postId, p_error: message, p_final: final,
+  /** Extend this worker's lease; false when the claim is no longer its own. */
+  async renewAutoconvert(postId: string, token: string, leaseMs: number): Promise<boolean> {
+    const { data, error } = await this.adminClient.rpc('hls_autoconvert_renew', {
+      p_post_id: postId, p_claim_token: token, p_lease: intervalOf(leaseMs),
+    });
+    if (error) {
+      throw new Error(`Failed to renew an auto-convert claim: ${error.message}`);
+    }
+    return data === true;
+  }
+
+  /** Record the outcome and release the claim; false when it was not this worker's. */
+  async autoconvertResult(postId: string, token: string, message: string | null, final: boolean): Promise<boolean> {
+    const { data, error } = await this.adminClient.rpc('hls_autoconvert_result', {
+      p_post_id: postId, p_claim_token: token, p_error: message, p_final: final,
     });
     if (error) {
       throw new Error(`Failed to record an auto-convert result: ${error.message}`);
     }
+    return data === true;
   }
 
   async enqueueReconcile(limit: number): Promise<number> {
@@ -352,7 +366,7 @@ export class SupabaseStorageService {
   /**
    * Upload multiple files (HLS segments and playlists)
    */
-  async uploadHlsFiles(hlsDir: string, baseRemotePath: string): Promise<string[]> {
+  async uploadHlsFiles(hlsDir: string, baseRemotePath: string, signal?: AbortSignal): Promise<string[]> {
     try {
       const uploadedFiles: string[] = [];
       const files = await fs.readdir(hlsDir, { recursive: true });
@@ -363,6 +377,9 @@ export class SupabaseStorageService {
           const stat = await fs.stat(localFilePath);
           
           if (stat.isFile()) {
+            if (signal?.aborted) {
+              throw new Error(`upload cancelled: ${String((signal.reason as Error)?.message ?? signal.reason)}`);
+            }
             const remotePath = path.join(baseRemotePath, file).replace(/\\/g, '/');
             await this.uploadFile(localFilePath, remotePath);
             uploadedFiles.push(remotePath);
@@ -421,4 +438,9 @@ export class SupabaseStorageService {
       throw error;
     }
   }
+}
+
+/** A PostgreSQL interval for [ms] milliseconds. */
+function intervalOf(ms: number): string {
+  return `${Math.max(0, Math.round(ms)) / 1000} seconds`;
 }

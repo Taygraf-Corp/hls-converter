@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import cors from 'cors';
 import path from 'path';
-import { FFmpegService } from './services/ffmpeg.js';
+import { FFmpegService, cancelledError } from './services/ffmpeg.js';
 import { SupabaseStorageService } from './services/supabase.js';
 import { VideoFile, ConversionOptions } from './types/index.js';
 import { logger } from './utils/logger.js';
@@ -60,7 +60,8 @@ const storageService = new SupabaseStorageService();
 async function processVideo(
   inputPath: string,
   filename: string,
-  storagePath: string
+  storagePath: string,
+  signal?: AbortSignal
 ): Promise<{
   success: boolean;
   outputFiles?: string[];
@@ -116,14 +117,17 @@ async function processVideo(
       smartOptions,
       (progress) => {
         logger.debug(`Conversion progress: ${progress.toFixed(1)}%`);
-      }
+      },
+      signal
     );
 
     // Upload to Supabase Storage
+    if (signal?.aborted) throw cancelledError(signal);
     logger.info(`Uploading to storage: ${storagePath}`);
     const uploadedFiles = await storageService.uploadHlsFiles(
       outputDir,
-      storagePath
+      storagePath,
+      signal
     );
 
     const processingTime = Date.now() - startTime;
@@ -200,13 +204,35 @@ const lifecycle = new HlsLifecycle(storageService, {
 });
 
 /**
+ * Settle with [p], or fail as soon as [signal] aborts. The abandoned promise
+ * keeps running; its failure is swallowed here.
+ */
+function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return p;
+  p.catch(() => {});
+  return new Promise<T>((resolve, reject) => {
+    if (signal.aborted) return reject(cancelledError(signal));
+    const onAbort = () => reject(cancelledError(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then(
+      v => { signal.removeEventListener('abort', onAbort); resolve(v); },
+      e => { signal.removeEventListener('abort', onAbort); reject(e); },
+    );
+  });
+}
+
+/**
  * Convert [postId]'s own video from bucket/videoPath, under the lifecycle's
  * policy. Shared by /api/process-from-storage and the auto-convert scan.
+ * [signal] cancels the work (ffmpeg is killed, nothing more is uploaded, and
+ * the attempt folder is removed); the route passes none.
  */
-async function convertFromStorage(postId: string, sourceBucket: string, videoPath: string): Promise<Outcome> {
+async function convertFromStorage(postId: string, sourceBucket: string, videoPath: string, signal?: AbortSignal): Promise<Outcome> {
   let tempDir: string | null = null;
+  let download: Promise<unknown> | null = null;
   try {
     return await lifecycle.convert(postId, sourceBucket, videoPath, async (attemptDir) => {
+      if (signal?.aborted) throw cancelledError(signal);
       // The local copy gets a fixed name: ffmpeg's output paths are built from
       // it, and a stored name with a space (n8n uploads) broke the segment path.
       const ext = path.extname(videoPath);
@@ -215,11 +241,14 @@ async function convertFromStorage(postId: string, sourceBucket: string, videoPat
       tempDir = generateTempDir(migrationConfig.processing.tempDir, 'storage-process');
       await ensureDir(tempDir);
       const tempPath = path.join(tempDir, videoFile.name);
-      await storageService.downloadFile(videoFile, tempPath);
-      const result = await processVideo(tempPath, videoFile.name, attemptDir);
+      download = storageService.downloadFile(videoFile, tempPath);
+      await abortable(download, signal);
+      download = null;
+      const result = await processVideo(tempPath, videoFile.name, attemptDir, signal);
       if (!result.success) {
         throw new Error(result.error || 'conversion failed');
       }
+      if (signal?.aborted) throw cancelledError(signal);
       const files = result.outputFiles ?? [];
       const master = files.find(f => f.endsWith('master.m3u8'));
       if (!master) {
@@ -228,16 +257,28 @@ async function convertFromStorage(postId: string, sourceBucket: string, videoPat
       return { master, files, metadata: result.metadata, processingTime: result.processingTime };
     });
   } finally {
-    if (tempDir) {
-      await cleanup([tempDir]).catch(() => {});
+    const dir: string | null = tempDir;
+    if (dir) {
+      if (download) {
+        // A cancelled download may still write into dir; remove it after.
+        void (download as Promise<unknown>).catch(() => {}).finally(() => cleanup([dir]).catch(() => {}));
+      } else {
+        await cleanup([dir]).catch(() => {});
+      }
     }
   }
 }
 
-/** Automatic conversion of new videos nobody asked HLS for (n8n, failed app requests). */
+/**
+ * Automatic conversion of new videos nobody asked HLS for (n8n, failed app
+ * requests). Off unless HLS_AUTOCONVERT_INTERVAL_MS is set (e.g. 600000), so a
+ * deploy alone never starts it.
+ */
 const autoConvert = new HlsAutoConvert(storageService, convertFromStorage, () => lifecycle.queueHealthy(), {
-  intervalMs: Number(process.env.HLS_AUTOCONVERT_INTERVAL_MS ?? 600_000),
-  batch: Number(process.env.HLS_AUTOCONVERT_BATCH || 2),
+  intervalMs: Number(process.env.HLS_AUTOCONVERT_INTERVAL_MS || 0),
+  batch: Number(process.env.HLS_AUTOCONVERT_BATCH || 1),
+  leaseMs: Number(process.env.HLS_AUTOCONVERT_LEASE_MS || 900_000),
+  timeoutMs: Number(process.env.HLS_AUTOCONVERT_TIMEOUT_MS || 1_800_000),
 });
 
 // Routes
