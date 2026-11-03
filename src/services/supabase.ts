@@ -101,7 +101,10 @@ export class SupabaseStorageService {
   async publishHlsUrl(post: PostRow, hlsUrl: string, now: Date = new Date()): Promise<boolean> {
     let q: any = this.adminClient.from('posts').update({ hls_url: hlsUrl });
     q = applyConditions(q, publishConditions(post, now));
-    const { data, error } = await q.select('id');
+    // PostgREST also applies the or=(...) filters to the rows it returns, so
+    // every column they name must be selected; select('id') failed every
+    // publish in production with "column posts.is_hidden does not exist".
+    const { data, error } = await q.select(POST_COLUMNS);
     if (error) {
       throw new Error(`Failed to set hls_url: ${error.message}`);
     }
