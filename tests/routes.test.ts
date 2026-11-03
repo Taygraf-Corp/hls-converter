@@ -49,6 +49,10 @@ const faults = {
   autoMissing: false,
   /** "<bucket>/<path>" -> delay storage reads of that object by this many ms */
   slowGet: new Map<string, number>(),
+  /** post ids whose lease renewals never get an answer */
+  hangRenew: new Set<string>(),
+  /** post ids whose HLS uploads never get an answer, but are stored anyway once the client gives up */
+  hangUpload: new Set<string>(),
 };
 /** hls_claim_autoconvert stand-in: posts the database would offer, and the recorded results. */
 const auto = {
@@ -62,6 +66,10 @@ const auto = {
   /** claim/renew/result calls in order, e.g. "claim <id>" */
   events: [] as string[],
   claims: 0, calls: 0,
+  /** hung renewals the client gave up on */
+  renewAborted: 0,
+  /** uploads stored after the client had given up on them */
+  lateWrites: 0,
 };
 const sent: { patches: string[] } = { patches: [] };
 
@@ -184,6 +192,11 @@ const mock = http.createServer(async (req, res) => {
         return send(200, [{ post_id: p, attempts: n, claim_token: token, lease_until: new Date().toISOString() }]);
       }
       case 'hls_autoconvert_renew': {
+        if (faults.hangRenew.has(args.p_post_id)) {
+          auto.events.push(`renew ${args.p_post_id} hung`);
+          res.on('close', () => { auto.renewAborted++; });
+          return; // never answered
+        }
         const ok = auto.tokens.get(args.p_post_id) === args.p_claim_token && !auto.lostClaims.has(args.p_post_id);
         auto.events.push(`renew ${args.p_post_id} ${ok}`);
         return send(200, ok);
@@ -241,6 +254,14 @@ const mock = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' || req.method === 'PUT') {
       const m = /^FlutterFlow\/converted\/([^/]+)\/hls\//.exec(key);
+      if (m && faults.hangUpload.has(m[1])) {
+        // Never answered; storage still stores it once the client has gone.
+        res.on('close', () => setTimeout(() => {
+          objects.set(key, { data: raw, modifiedAt: Date.now() });
+          auto.lateWrites++;
+        }, 100));
+        return;
+      }
       if (m) {
         const post = m[1];
         const counter = (uploads.get(post) ?? 0) + 1;
@@ -265,6 +286,7 @@ let server: ChildProcess;
 let port = 0;
 let tmp = '';
 let clip: Buffer;
+let longClip: Buffer;
 
 async function call(route: string, payload: unknown, method = 'POST') {
   const r = await fetch(`http://127.0.0.1:${port}${route}`, {
@@ -301,6 +323,15 @@ before(async () => {
     '-c:v', 'libx264', '-c:a', 'aac', '-shortest', clipPath,
   ]);
   clip = fs.readFileSync(clipPath);
+  // A video that takes far longer than the 4 s auto-convert timeout to convert.
+  // Made here, before the stand-in starts: generating it blocks this process.
+  const longPath = path.join(tmp, 'long.mp4');
+  execFileSync(ffmpegInstaller.path, [
+    '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc=size=1280x720:rate=30',
+    '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '90', '-pix_fmt', 'yuv420p',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest', longPath,
+  ]);
+  longClip = fs.readFileSync(longPath);
 
   await new Promise<void>(r => mock.listen(0, '127.0.0.1', () => r()));
   const mockPort = (mock.address() as any).port;
@@ -312,10 +343,11 @@ before(async () => {
       SUPABASE_ANON_KEY: 'anon', SUPABASE_SERVICE_ROLE_KEY: 'service',
       API_KEY: KEY, PORT: String(port), TEMP_DIR: path.join(tmp, 'work'),
       SOURCE_BUCKET: 'FlutterFlow', TARGET_BUCKET: 'FlutterFlow', TARGET_FOLDER: 'converted',
-      PUBLIC_STORAGE_BASE_URL: BASE, ENABLE_ADMIN_ROUTES: '', LOG_LEVEL: 'error',
+      PUBLIC_STORAGE_BASE_URL: BASE, ENABLE_ADMIN_ROUTES: '', LOG_LEVEL: process.env.TEST_LOG_LEVEL || 'error',
       HLS_RECONCILE_INTERVAL_MS: '150', HLS_QUEUE_HEALTH_MS: '1000', HLS_STALE_MS: String(HOUR),
       HLS_AUTOCONVERT_INTERVAL_MS: '200', HLS_AUTOCONVERT_BATCH: '2',
-      HLS_AUTOCONVERT_LEASE_MS: '600', HLS_AUTOCONVERT_TIMEOUT_MS: '4000',
+      HLS_AUTOCONVERT_LEASE_MS: '2000', HLS_AUTOCONVERT_TIMEOUT_MS: '4000',
+      HLS_AUTOCONVERT_REQUEST_TIMEOUT_MS: '500', HLS_AUTOCONVERT_LATE_SWEEP_MS: '800',
     },
     stdio: ['ignore', 'ignore', 'inherit'],
   });
@@ -703,17 +735,12 @@ test('auto-convert: without the backend functions or a healthy queue it does not
 });
 
 test('auto-convert P1: a conversion that runs past the timeout is cancelled, ffmpeg is killed and nothing is published', async () => {
-  const longClip = path.join(tmp, 'long.mp4');
-  execFileSync(ffmpegInstaller.path, [
-    '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc=size=1280x720:rate=30',
-    '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '90', '-pix_fmt', 'yuv420p',
-    '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest', longClip,
-  ]);
   const row = seed(57);
-  objects.set(`unfiltered/${row.media_path}`, { data: fs.readFileSync(longClip), modifiedAt: Date.now() });
+  objects.set(`unfiltered/${row.media_path}`, { data: longClip, modifiedAt: Date.now() });
   const started = Date.now();
   auto.offer.push(id(57));
-  await until(() => auto.results.has(id(57)), 'the timed-out attempt recorded', 30000);
+  await until(() => auto.results.has(id(57)), 'the timed-out attempt recorded', 30000)
+    .catch(e => { throw new Error(`${e.message}; events: ${auto.events.filter(x => x.includes(id(57))).join(' | ')}`); });
   const took = Date.now() - started;
   assert.ok(took < 9000, `cancelled after about the 4 s timeout, took ${took} ms`);
   assert.equal(auto.results.get(id(57))!.final, false, 'a timeout may be retried');
@@ -721,24 +748,75 @@ test('auto-convert P1: a conversion that runs past the timeout is cancelled, ffm
   assert.equal(row.hls_url, null);
   await until(() => hlsKeys(57).length === 0, 'the attempt folder removed');
   const work = path.join(tmp, 'work');
-  const ffmpegs = execFileSync('ps', ['-eo', 'args']).toString().split('\n').filter(l => l.includes('ffmpeg') && l.includes(work));
+  const ffmpegs = execFileSync('ps', ['-ww', '-eo', 'args']).toString().split('\n').filter(l => l.includes('ffmpeg') && l.includes(work));
   assert.deepEqual(ffmpegs, [], 'no ffmpeg left running');
 });
 
 test('auto-convert P1: a worker that loses its claim stops at once and records nothing', async () => {
   const row = seed(58);
-  faults.slowGet.set(`unfiltered/${row.media_path}`, 3000);   // the download hangs
+  objects.set(`unfiltered/${row.media_path}`, { data: longClip, modifiedAt: Date.now() }); // encodes for far longer than the test
   auto.lostClaims.add(id(58));                               // another task holds the claim now
   seed(59);
   auto.offer.push(id(58), id(59));
   await until(() => auto.events.includes(`claim ${id(58)}`), 'claimed');
   const claimedAt = Date.now();
   await until(() => auto.results.has(id(59)), 'the next post converted', 10000);
-  assert.ok(Date.now() - claimedAt < 2800, 'the worker moved on before the download would have finished');
+  assert.ok(Date.now() - claimedAt < 2500, 'the worker stopped at the first refused renewal (0.5 s) and moved on');
   assert.ok(auto.events.includes(`renew ${id(58)} false`));
   assert.ok(!auto.events.some(e => e.startsWith(`result ${id(58)}`)), 'no result for a claim that is not ours');
   assert.equal(row.hls_url, null);
   assert.deepEqual(hlsKeys(58), []);
   assert.ok(posts.get(id(59))!.hls_url);
-  faults.slowGet.clear();
+});
+
+test('auto-convert P1: renewals that never answer cannot keep work alive past the lease deadline', async () => {
+  const row = seed(60);
+  // Encoding this takes far longer than the 4 s timeout.
+  objects.set(`unfiltered/${row.media_path}`, { data: longClip, modifiedAt: Date.now() });
+  faults.hangRenew.add(id(60));
+  seed(61);
+  auto.offer.push(id(60), id(61));
+  await until(() => auto.events.includes(`claim ${id(60)}`), 'claimed');
+  const claimedAt = Date.now();
+  await until(() => auto.events.includes(`claim ${id(61)}`), 'the next claim', 10000);
+  const stoppedAfter = Date.now() - claimedAt;
+  // Lease 2 s: the watchdog cancels 1 s after the last confirmation (the
+  // claim), and the work has stopped by 1.5 s, well before the 4 s timeout.
+  assert.ok(stoppedAfter < 2000, `stopped ${stoppedAfter} ms after the claim`);
+  assert.ok(auto.events.includes(`renew ${id(60)} hung`));
+  await until(() => auto.renewAborted >= 1, 'the hung renewal request was given up', 3000);
+  assert.ok(!auto.events.some(e => e.startsWith(`result ${id(60)}`)), 'no result for an unconfirmed claim');
+  assert.equal(row.hls_url, null);
+  assert.deepEqual(hlsKeys(60), []);
+  await until(() => auto.results.has(id(61)), 'the next post converted', 10000);
+  const work = path.join(tmp, 'work');
+  assert.deepEqual(execFileSync('ps', ['-ww', '-eo', 'args']).toString().split('\n').filter(l => l.includes('ffmpeg') && l.includes(work)), [],
+    'no ffmpeg left running');
+  faults.hangRenew.clear();
+});
+
+test('auto-convert P1: an upload that never answers is cut off, and a copy stored late is removed', async () => {
+  const row = seed(62);
+  faults.hangUpload.add(id(62));
+  seed(63);
+  auto.offer.push(id(62), id(63));
+  await until(() => auto.events.includes(`claim ${id(62)}`), 'claimed');
+  const claimedAt = Date.now();
+  await until(() => auto.results.has(id(62)), 'the attempt ended', 10000);
+  const took = Date.now() - claimedAt;
+  assert.ok(took < 3000, `the hung upload was cut off by the 0.5 s request limit, not waited on (${took} ms)`);
+  assert.equal(auto.results.get(id(62))!.final, false);
+  assert.equal(row.hls_url, null);
+  await until(() => auto.results.has(id(63)), 'the next post was not blocked', 10000);
+  await until(() => auto.lateWrites >= 1, 'storage stored the abandoned upload late', 5000);
+  await until(() => hlsKeys(62).length === 0, 'the late copy removed by the second sweep', 5000);
+  const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+  assert.equal(health.autoConvert.background, 0, 'nothing of the attempt is still running');
+  faults.hangUpload.clear();
+});
+
+test('health reports the auto-convert state for rollback checks', async () => {
+  const h = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+  assert.deepEqual(Object.keys(h.autoConvert).sort(), ['background', 'state']);
+  assert.ok(['idle', 'working'].includes(h.autoConvert.state));
 });

@@ -10,25 +10,34 @@
  * is taken from the post row itself and HlsLifecycle.convert() applies the
  * full policy, so a claim never widens what may be converted.
  *
- * Ownership (CTO review 2026-11-03):
- *  P1  A post is claimed only when work on it starts, one at a time, so a post
- *      never waits behind another while its attempts are counted. The claim is
- *      a lease the worker renews while it works (every lease/3). When renewal
- *      says the claim is no longer ours, or renewals keep failing until the
- *      lease is nearly over, or HLS_AUTOCONVERT_TIMEOUT_MS passes, the work is
- *      cancelled: ffmpeg is killed, nothing more is uploaded and the attempt
- *      folder is removed (HlsLifecycle.convert's failure path).
- *  P2  Renewal and the result carry the claim token; the database ignores
- *      either for a claim that is no longer current, so a late worker cannot
- *      finish or extend a newer attempt.
+ * Ownership (CTO reviews 2026-11-03). One post is claimed when its work
+ * starts, under a lease the worker renews with its claim token. With lease L:
+ *   - renewal is sent every L/4 and each request is aborted after L/8;
+ *   - an independent watchdog cancels the work once L/2 has passed since the
+ *     last renewal the database confirmed (measured from when that request
+ *     was sent), whatever the renewal requests are doing;
+ *   - a refused renewal (the claim is someone else's now) cancels at once;
+ *   - HLS_AUTOCONVERT_TIMEOUT_MS cancels a conversion that runs too long.
+ * Cancelling kills ffmpeg and waits for it to exit, aborts every storage and
+ * database request of the attempt (each is also limited to
+ * HLS_AUTOCONVERT_REQUEST_TIMEOUT_MS, at most L/4), stops uploading and removes
+ * the attempt folder. The worker waits at most L/4 for that, so its work has
+ * stopped within 3L/4 of the last confirmed renewal, before the lease can
+ * lapse. Anything still settling is counted in status().background. A late
+ * second removal of the attempt folder catches an upload whose request was
+ * aborted but which storage still stored; the hourly reconcile scan is the
+ * backstop for both.
+ *
+ * Renewal and the result carry the claim token; the database ignores either
+ * for a claim that is no longer current. A worker that lost its claim records
+ * nothing.
  *
  *  - Runs only while the revocation queue is healthy and never overlaps itself.
  *  - Missing functions (the SQL not applied yet) only log; nothing else changes.
- *  - HLS_AUTOCONVERT_INTERVAL_MS=0 (the default) turns it off. Turning it off
- *    stops new claims; a conversion already running finishes or is cancelled
- *    by its timeout.
+ *  - HLS_AUTOCONVERT_INTERVAL_MS=0 (the default) turns it off.
  */
 import { logger } from '../utils/logger.js';
+import { runWithRequestScope } from '../utils/request-scope.js';
 import { PostRow, sourceOf } from './hls-policy.js';
 import type { Outcome } from './hls-lifecycle.js';
 
@@ -42,24 +51,34 @@ export interface AutoConvertStore {
   getPostForHls(postId: string): Promise<PostRow | null>;
   /** One post to convert now under a lease of [leaseMs], or null. */
   claimAutoconvert(leaseMs: number): Promise<AutoConvertClaim | null>;
-  /** False: the claim is no longer this worker's. */
-  renewAutoconvert(postId: string, token: string, leaseMs: number): Promise<boolean>;
+  /** False: the claim is no longer this worker's. The request ends after [timeoutMs]. */
+  renewAutoconvert(postId: string, token: string, leaseMs: number, timeoutMs: number): Promise<boolean>;
   /** Records the outcome and releases the claim. False: not this worker's claim. */
   autoconvertResult(postId: string, token: string, error: string | null, final: boolean): Promise<boolean>;
 }
 
 /** Converts one post's own video; the route's conversion path. */
-export type ConvertPost = (postId: string, bucket: string, objectPath: string, signal?: AbortSignal) => Promise<Outcome>;
+export type ConvertPost = (
+  postId: string,
+  bucket: string,
+  objectPath: string,
+  signal?: AbortSignal,
+  onLateWork?: (work: () => Promise<unknown>) => void,
+) => Promise<Outcome>;
 
 export interface AutoConvertOptions {
   /** Interval between scans; 0 disables. */
   intervalMs: number;
   /** Posts converted per scan, one after another. */
   batch: number;
-  /** Lease per claim; renewed every third of it. */
+  /** Lease per claim (L above). */
   leaseMs: number;
   /** Longest one conversion may run before it is cancelled. */
   timeoutMs: number;
+  /** Limit for each storage/database request of an attempt; capped at L/4. */
+  requestTimeoutMs: number;
+  /** Delay before the second removal of a cancelled attempt's folder. */
+  lateSweepMs?: number;
 }
 
 export interface AutoConvertRun {
@@ -67,8 +86,14 @@ export interface AutoConvertRun {
   converted: number;
   refused: number;
   failed: number;
-  /** Cancelled because the claim stopped being ours; no result recorded. */
+  /** Stopped because the claim was lost or could not be confirmed; no result recorded. */
   lost: number;
+}
+
+export interface AutoConvertStatus {
+  state: 'off' | 'idle' | 'working';
+  /** Cancelled work still settling, and pending late removals. */
+  background: number;
 }
 
 /** 403 and 409 mean the converter will not convert this post: no retry. */
@@ -76,9 +101,13 @@ export function isFinal(status: number): boolean {
   return status === 403 || status === 409;
 }
 
+type Result = { error: string | null; final: boolean };
+
 export class HlsAutoConvert {
   private timer: NodeJS.Timeout | null = null;
   private running = false;
+  private working = false;
+  private background = 0;
 
   constructor(
     private store: AutoConvertStore,
@@ -87,6 +116,25 @@ export class HlsAutoConvert {
     private opts: AutoConvertOptions,
   ) {}
 
+  status(): AutoConvertStatus {
+    return {
+      state: this.opts.intervalMs <= 0 ? 'off' : this.working ? 'working' : 'idle',
+      background: this.background,
+    };
+  }
+
+  private get lease() {
+    const L = Math.max(1, this.opts.leaseMs);
+    return {
+      renewEveryMs: Math.max(1, Math.floor(L / 4)),
+      renewTimeoutMs: Math.max(1, Math.floor(L / 8)),
+      unconfirmedMs: Math.floor(L / 2),
+      stopGraceMs: Math.max(1, Math.floor(L / 4)),
+      watchEveryMs: Math.max(10, Math.min(1000, Math.floor(L / 20))),
+      requestTimeoutMs: Math.max(1, Math.min(this.opts.requestTimeoutMs, Math.floor(L / 4))),
+    };
+  }
+
   async runOnce(): Promise<AutoConvertRun> {
     const run: AutoConvertRun = { claimed: 0, converted: 0, refused: 0, failed: 0, lost: 0 };
     if (this.running) return run;
@@ -94,7 +142,8 @@ export class HlsAutoConvert {
     try {
       const batch = Math.max(1, Math.min(this.opts.batch, 20));
       for (let i = 0; i < batch && this.healthy(); i++) {
-        // Claim only now, when this post's work starts (P1).
+        // Claim only now, when this post's work starts.
+        const sentAt = Date.now();
         let claim: AutoConvertClaim | null;
         try {
           claim = await this.store.claimAutoconvert(this.opts.leaseMs);
@@ -104,8 +153,12 @@ export class HlsAutoConvert {
         }
         if (!claim) break;
         run.claimed++;
-        const r = await this.work(claim);
-        run[r]++;
+        this.working = true;
+        try {
+          run[await this.work(claim, sentAt)]++;
+        } finally {
+          this.working = false;
+        }
       }
       if (run.claimed > 0) logger.info(`Auto-convert: ${JSON.stringify(run)}`);
       return run;
@@ -114,47 +167,59 @@ export class HlsAutoConvert {
     }
   }
 
-  /** Convert one claimed post under its lease. */
-  private async work(claim: AutoConvertClaim): Promise<'converted' | 'refused' | 'failed' | 'lost'> {
+  /** Convert one claimed post under its lease. [claimSentAt]: when the claim request was sent. */
+  private async work(claim: AutoConvertClaim, claimSentAt: number): Promise<'converted' | 'refused' | 'failed' | 'lost'> {
     const { post_id: postId, claim_token: token } = claim;
+    const t = this.lease;
     const controller = new AbortController();
     let lost = false;
-    let lastRenewed = Date.now();
-    const timeout = setTimeout(
-      () => controller.abort(new Error(`timed out after ${this.opts.timeoutMs} ms`)),
-      this.opts.timeoutMs,
-    );
-    const renewal = setInterval(() => {
-      this.store.renewAutoconvert(postId, token, this.opts.leaseMs).then(
-        ok => {
-          if (ok) {
-            lastRenewed = Date.now();
-          } else if (!lost) {
-            lost = true;
-            controller.abort(new Error('the claim is no longer ours'));
-          }
-        },
-        error => {
-          logger.warn(`Auto-convert lease renewal failed: ${errorText(error)}`);
-          // Stop before the lease can run out under us and another task claims it.
-          if (!lost && Date.now() - lastRenewed >= this.opts.leaseMs * 0.8) {
-            lost = true;
-            controller.abort(new Error('could not renew the claim'));
-          }
-        },
-      );
-    }, Math.max(100, Math.floor(this.opts.leaseMs / 3)));
+    let confirmedAt = claimSentAt;
+    const cancel = (why: string, claimLost: boolean) => {
+      if (claimLost) lost = true;
+      if (!controller.signal.aborted) controller.abort(new Error(why));
+    };
 
-    let result: { error: string | null; final: boolean };
+    const timeout = setTimeout(() => cancel(`timed out after ${this.opts.timeoutMs} ms`, false), this.opts.timeoutMs);
+    let renewing = false;
+    const renewal = setInterval(() => {
+      if (renewing || lost) return;
+      renewing = true;
+      const sentAt = Date.now();
+      this.store.renewAutoconvert(postId, token, this.opts.leaseMs, t.renewTimeoutMs).then(
+        ok => {
+          if (ok) confirmedAt = Math.max(confirmedAt, sentAt);
+          else cancel('the claim is no longer ours', true);
+        },
+        error => logger.warn(`Auto-convert lease renewal failed: ${errorText(error)}`),
+      ).finally(() => { renewing = false; });
+    }, t.renewEveryMs);
+    // Independent of the renewal requests: a hung renewal cannot keep the work alive.
+    const watchdog = setInterval(() => {
+      if (Date.now() - confirmedAt >= t.unconfirmedMs) cancel('the lease could not be confirmed in time', true);
+    }, t.watchEveryMs);
+
+    const job = runWithRequestScope(controller.signal, t.requestTimeoutMs, () =>
+      this.convertOne(postId, controller.signal, late => this.lateWork(late)),
+    );
+    let result: Result | null;
     try {
-      result = await this.convertOne(postId, controller.signal);
+      result = await this.settle(job, controller.signal, t.stopGraceMs);
     } finally {
       clearTimeout(timeout);
       clearInterval(renewal);
+      clearInterval(watchdog);
     }
 
-    if (lost) {
-      logger.warn(`Auto-convert attempt ${claim.attempts} stopped: ${result.error ?? 'claim lost'}`);
+    if (result === null) {
+      logger.error('Auto-convert: cancelled work did not stop within the grace period; counted as background');
+      this.track(job);
+      if (!lost) {
+        // Our claim is still current: give it up as a retryable failure.
+        result = { error: String((controller.signal.reason as Error)?.message ?? 'cancelled'), final: false };
+      }
+    }
+    if (lost || result === null) {
+      logger.warn(`Auto-convert attempt ${claim.attempts} stopped: ${String((controller.signal.reason as Error)?.message ?? 'claim lost')}`);
       return 'lost';
     }
     if (result.error !== null) {
@@ -169,14 +234,50 @@ export class HlsAutoConvert {
     return result.error === null ? 'converted' : result.final ? 'refused' : 'failed';
   }
 
-  private async convertOne(postId: string, signal: AbortSignal): Promise<{ error: string | null; final: boolean }> {
+  /** [job]'s result; null when it is still running [graceMs] after [signal] aborted. */
+  private settle(job: Promise<Result>, signal: AbortSignal, graceMs: number): Promise<Result | null> {
+    return new Promise(resolve => {
+      let grace: NodeJS.Timeout | null = null;
+      const onAbort = () => { grace = setTimeout(() => resolve(null), graceMs); };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+      job.then(r => {
+        signal.removeEventListener('abort', onAbort);
+        if (grace) clearTimeout(grace);
+        resolve(r);
+      });
+    });
+  }
+
+  private track(p: Promise<unknown>): void {
+    this.background++;
+    p.catch(() => {}).finally(() => { this.background--; });
+  }
+
+  /** Run [work] after the late-sweep delay (an aborted upload may land meanwhile). */
+  private lateWork(work: () => Promise<unknown>): void {
+    const delay = this.opts.lateSweepMs ?? this.lease.requestTimeoutMs + 30_000;
+    this.track(new Promise<void>(resolve => {
+      const timer = setTimeout(() => {
+        work().catch(e => logger.warn(`Auto-convert late removal failed (the reconcile scan retries): ${errorText(e)}`))
+          .finally(() => resolve());
+      }, delay);
+      timer.unref?.();
+    }));
+  }
+
+  private async convertOne(
+    postId: string,
+    signal: AbortSignal,
+    onLateWork: (work: () => Promise<unknown>) => void,
+  ): Promise<Result> {
     try {
       const post = await this.store.getPostForHls(postId);
       if (!post) return { error: 'post not found', final: true };
       if (post.hls_url) return { error: null, final: false };
       const source = sourceOf(post);
       if (!source) return { error: 'post has no video source', final: true };
-      const outcome = await this.convertPost(postId, source.bucket, source.path, signal);
+      const outcome = await this.convertPost(postId, source.bucket, source.path, signal, onLateWork);
       if (outcome.status === 200) return { error: null, final: false };
       return { error: `${outcome.status} ${String(outcome.body.error ?? 'conversion failed')}`, final: isFinal(outcome.status) };
     } catch (error) {

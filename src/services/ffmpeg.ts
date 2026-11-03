@@ -469,29 +469,47 @@ export class FFmpegService {
         logger.debug('FFmpeg stderr:', stderrLine);
       });
 
-      // Cancellation (auto-convert timeout or lost claim) kills ffmpeg at once.
-      let cancelled = false;
+      // Cancellation (auto-convert timeout or lost claim), CTO re-review P2:
+      // fluent-ffmpeg prepares asynchronously before it spawns ffmpeg, so a
+      // kill() before 'start' finds no process. Kill on abort if running, and
+      // on 'start' if the abort came first. Settle only once ffmpeg has
+      // exited ('end' or 'error'), so the caller never cleans up under a
+      // running process.
+      let started = false;
       const onAbort = () => {
-        cancelled = true;
-        command.kill('SIGKILL');
-        reject(cancelledError(signal!));
+        if (started) command.kill('SIGKILL');
       };
       signal?.addEventListener('abort', onAbort, { once: true });
+      const settle = (error: Error | null) => {
+        signal?.removeEventListener('abort', onAbort);
+        if (signal?.aborted) {
+          reject(cancelledError(signal));
+        } else if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
 
       command
         .output(playlistPath)
+        .on('start', () => {
+          started = true;
+          if (signal?.aborted) command.kill('SIGKILL');
+        })
         .on('end', () => {
-          signal?.removeEventListener('abort', onAbort);
           logger.debug(`Variant stream created: ${playlistPath}`);
-          resolve();
+          settle(null);
         })
         .on('error', (error, stdout, stderr) => {
-          signal?.removeEventListener('abort', onAbort);
-          if (cancelled) return;
+          if (signal?.aborted) {
+            settle(null);
+            return;
+          }
           logger.error(`Error creating variant stream ${playlistPath}:`, error);
           logger.error('FFmpeg stdout:', stdout);
           logger.error('FFmpeg stderr:', stderr);
-          reject(new Error(`HLS conversion failed: ${error.message}\nStderr: ${stderr}`));
+          settle(new Error(`HLS conversion failed: ${error.message}\nStderr: ${stderr}`));
         })
         .run();
     });

@@ -3,6 +3,7 @@ import { migrationConfig } from '../config/index.js';
 import { VideoFile, StorageFile } from '../types/index.js';
 import { logger } from '../utils/logger.js';
 import { Condition, POST_COLUMNS, PostRow, publishConditions } from './hls-policy.js';
+import { scopedFetch } from '../utils/request-scope.js';
 import fs from 'fs/promises';
 import path from 'path';
 
@@ -49,9 +50,13 @@ export class SupabaseStorageService {
       throw new Error('Missing SUPABASE_SERVICE_ROLE_KEY');
     }
 
+    // scopedFetch: inside an auto-convert attempt, every request is
+    // time-limited and cancellable (utils/request-scope.ts); elsewhere it is
+    // plain fetch.
     this.adminClient = createClient(
       migrationConfig.supabase.url,
-      serviceRoleKey
+      serviceRoleKey,
+      { global: { fetch: scopedFetch } }
     );
   }
 
@@ -238,11 +243,14 @@ export class SupabaseStorageService {
     return rows[0] ?? null;
   }
 
-  /** Extend this worker's lease; false when the claim is no longer its own. */
-  async renewAutoconvert(postId: string, token: string, leaseMs: number): Promise<boolean> {
+  /**
+   * Extend this worker's lease; false when the claim is no longer its own.
+   * The request is aborted after [timeoutMs] (CTO re-review P1).
+   */
+  async renewAutoconvert(postId: string, token: string, leaseMs: number, timeoutMs: number): Promise<boolean> {
     const { data, error } = await this.adminClient.rpc('hls_autoconvert_renew', {
       p_post_id: postId, p_claim_token: token, p_lease: intervalOf(leaseMs),
-    });
+    }).abortSignal(AbortSignal.timeout(timeoutMs));
     if (error) {
       throw new Error(`Failed to renew an auto-convert claim: ${error.message}`);
     }

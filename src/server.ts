@@ -81,6 +81,8 @@ async function processVideo(
       throw new Error('Invalid video file');
     }
 
+    if (signal?.aborted) throw cancelledError(signal);
+
     // Get metadata and create smart conversion options
     const metadata = await ffmpegService.getVideoMetadata(inputPath);
     const baseOptions: ConversionOptions = {
@@ -110,6 +112,7 @@ async function processVideo(
     const outputDir = path.join(tempDir, 'hls');
 
     // Convert to HLS
+    if (signal?.aborted) throw cancelledError(signal);
     logger.info(`Converting to HLS...`);
     const outputFiles = await ffmpegService.convertToHls(
       inputPath,
@@ -224,14 +227,26 @@ function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
 /**
  * Convert [postId]'s own video from bucket/videoPath, under the lifecycle's
  * policy. Shared by /api/process-from-storage and the auto-convert scan.
- * [signal] cancels the work (ffmpeg is killed, nothing more is uploaded, and
- * the attempt folder is removed); the route passes none.
+ * [signal] cancels the work (ffmpeg is killed and awaited, nothing more is
+ * uploaded, and the attempt folder is removed); the route passes none.
+ * After a cancellation, [onLateWork] receives a second removal of the attempt
+ * folder for the caller to run later: an upload whose request was aborted may
+ * still have been stored (CTO re-review P1).
  */
-async function convertFromStorage(postId: string, sourceBucket: string, videoPath: string, signal?: AbortSignal): Promise<Outcome> {
+async function convertFromStorage(
+  postId: string,
+  sourceBucket: string,
+  videoPath: string,
+  signal?: AbortSignal,
+  onLateWork?: (work: () => Promise<unknown>) => void,
+): Promise<Outcome> {
   let tempDir: string | null = null;
   let download: Promise<unknown> | null = null;
+  let attempt: string | null = null;
+  let outcome: Outcome | null = null;
   try {
-    return await lifecycle.convert(postId, sourceBucket, videoPath, async (attemptDir) => {
+    return outcome = await lifecycle.convert(postId, sourceBucket, videoPath, async (attemptDir) => {
+      attempt = attemptDir;
       if (signal?.aborted) throw cancelledError(signal);
       // The local copy gets a fixed name: ffmpeg's output paths are built from
       // it, and a stored name with a space (n8n uploads) broke the segment path.
@@ -257,6 +272,19 @@ async function convertFromStorage(postId: string, sourceBucket: string, videoPat
       return { master, files, metadata: result.metadata, processingTime: result.processingTime };
     });
   } finally {
+    // An attempt that did not publish may still receive an upload whose
+    // request was cut off (cancelled, or over its time limit) but which
+    // storage stored anyway. Remove its folder once more later, unless the
+    // row now plays from it (a publish whose outcome was unknown).
+    const failedAttempt: string | null = attempt;
+    const done = outcome as Outcome | null;
+    if (failedAttempt && onLateWork && (done === null || done.status !== 200)) {
+      onLateWork(async () => {
+        const current = await storageService.getHlsUrl(postId);
+        if (current && current.includes(`/${failedAttempt}/`)) return;
+        await storageService.removeTree(failedAttempt);
+      });
+    }
     const dir: string | null = tempDir;
     if (dir) {
       if (download) {
@@ -279,6 +307,8 @@ const autoConvert = new HlsAutoConvert(storageService, convertFromStorage, () =>
   batch: Number(process.env.HLS_AUTOCONVERT_BATCH || 1),
   leaseMs: Number(process.env.HLS_AUTOCONVERT_LEASE_MS || 900_000),
   timeoutMs: Number(process.env.HLS_AUTOCONVERT_TIMEOUT_MS || 1_800_000),
+  requestTimeoutMs: Number(process.env.HLS_AUTOCONVERT_REQUEST_TIMEOUT_MS || 120_000),
+  lateSweepMs: process.env.HLS_AUTOCONVERT_LATE_SWEEP_MS ? Number(process.env.HLS_AUTOCONVERT_LATE_SWEEP_MS) : undefined,
 });
 
 // Routes
@@ -299,6 +329,9 @@ app.get('/health', (req: Request, res: Response) => {
     // 'ok' while the HLS revocation queue is drained; private media is only
     // converted then. The ALB health check only needs the 200.
     revocationQueue: lifecycle.queueHealthy() ? 'ok' : 'unavailable',
+    // 'off' | 'idle' | 'working', and auto-convert work still settling after a
+    // cancellation. Before rolling back: 'off' or 'idle', and 0.
+    autoConvert: autoConvert.status(),
     timestamp: new Date().toISOString()
   });
 });
