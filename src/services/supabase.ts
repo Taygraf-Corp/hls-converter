@@ -228,6 +228,24 @@ export class SupabaseStorageService {
     }
   }
 
+  /** Recent video posts without HLS to convert now (hls_claim_autoconvert). */
+  async claimAutoconvert(limit: number): Promise<{ post_id: string; attempts: number }[]> {
+    const { data, error } = await this.adminClient.rpc('hls_claim_autoconvert', { p_limit: limit });
+    if (error) {
+      throw new Error(`Failed to claim auto-convert work: ${error.message}`);
+    }
+    return (data ?? []) as { post_id: string; attempts: number }[];
+  }
+
+  async autoconvertResult(postId: string, message: string | null, final: boolean): Promise<void> {
+    const { error } = await this.adminClient.rpc('hls_autoconvert_result', {
+      p_post_id: postId, p_error: message, p_final: final,
+    });
+    if (error) {
+      throw new Error(`Failed to record an auto-convert result: ${error.message}`);
+    }
+  }
+
   async enqueueReconcile(limit: number): Promise<number> {
     const { data, error } = await this.adminClient.rpc('hls_enqueue_reconcile', { p_limit: limit });
     if (error) {

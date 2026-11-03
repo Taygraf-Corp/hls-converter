@@ -45,7 +45,11 @@ const faults = {
   /** fail storage removals under this prefix */
   failRemove: new Set<string>(),
   queueDown: false,
+  /** the auto-convert functions do not exist (backend SQL not applied) */
+  autoMissing: false,
 };
+/** hls_claim_autoconvert stand-in: posts the database would offer, and the recorded results. */
+const auto = { offer: [] as string[], attempts: new Map<string, number>(), results: new Map<string, { error: string | null; final: boolean }>(), claims: 0, calls: 0 };
 const sent: { patches: string[] } = { patches: [] };
 
 function privPost(n: number, over: Row = {}): Row {
@@ -130,6 +134,7 @@ const mock = http.createServer(async (req, res) => {
     return send(200, deletionJobs.filter(j => j.profile_id === profile).map(j => ({ id: j.id })));
   }
   if (u.pathname.startsWith('/rest/v1/rpc/')) {
+    if (u.pathname.endsWith('/hls_claim_autoconvert')) auto.calls++;
     if (faults.queueDown) return send(503, { message: 'simulated queue outage' });
     const args = raw.length ? JSON.parse(raw.toString()) : {};
     switch (u.pathname.slice('/rest/v1/rpc/'.length)) {
@@ -152,6 +157,19 @@ const mock = http.createServer(async (req, res) => {
       }
       case 'hls_enqueue_reconcile':
         return send(200, 0);
+      case 'hls_claim_autoconvert': {
+        if (faults.autoMissing) return send(404, { code: 'PGRST202', message: 'Could not find the function public.hls_claim_autoconvert' });
+        auto.claims++;
+        const picked = auto.offer.splice(0, args.p_limit);
+        return send(200, picked.map(p => {
+          const n = (auto.attempts.get(p) ?? 0) + 1;
+          auto.attempts.set(p, n);
+          return { post_id: p, attempts: n };
+        }));
+      }
+      case 'hls_autoconvert_result':
+        auto.results.set(args.p_post_id, { error: args.p_error, final: args.p_final });
+        return send(200, null);
     }
   }
   if (u.pathname.startsWith('/storage/v1/object/list/')) {
@@ -267,6 +285,7 @@ before(async () => {
       SOURCE_BUCKET: 'FlutterFlow', TARGET_BUCKET: 'FlutterFlow', TARGET_FOLDER: 'converted',
       PUBLIC_STORAGE_BASE_URL: BASE, ENABLE_ADMIN_ROUTES: '', LOG_LEVEL: 'error',
       HLS_RECONCILE_INTERVAL_MS: '150', HLS_QUEUE_HEALTH_MS: '1000', HLS_STALE_MS: String(HOUR),
+      HLS_AUTOCONVERT_INTERVAL_MS: '200', HLS_AUTOCONVERT_BATCH: '2',
     },
     stdio: ['ignore', 'ignore', 'inherit'],
   });
@@ -584,4 +603,61 @@ test('revoking a hidden legacy post also removes a copy it alone plays from anot
   assert.equal(r.status, 200, JSON.stringify(r.json));
   assert.equal(objects.has('FlutterFlow/converted/1736606618523/hls/master.m3u8'), false);
   assert.equal(row.hls_url, null);
+});
+
+test('auto-convert: new videos nobody asked HLS for are converted from their own row, under the same policy', async () => {
+  const unified = seed(50);
+  const n8n = seed(51, {
+    media_bucket: null, media_path: null, channel: 'standard', in_general_feed: false, type: 'PUBLIC',
+    video_url: 'https://ref.supabase.co/storage/v1/object/public/FlutterFlow/Videos/multi-account/someone/multiacct%2051.mp4',
+  });
+  objects.set('FlutterFlow/Videos/multi-account/someone/multiacct 51.mp4', { data: clip, modifiedAt: Date.now() });
+  seed(52, { is_hidden: true });                                   // the claim offers it anyway
+  seed(53);
+  objects.delete(`unfiltered/${posts.get(id(53))!.media_path}`);  // source missing
+  const done = seed(54, { hls_url: `${BASE}converted/${id(54)}/hls/vx/master.m3u8` });
+  auto.offer.push(id(50), id(51), id(52), id(53), id(54), id(55)); // 55: no such post
+  await until(() => auto.results.size >= 6, 'six results recorded', 30000);
+
+  assert.deepEqual(auto.results.get(id(50)), { error: null, final: false });
+  assert.match(unified.hls_url, new RegExp(`^${BASE}converted/${id(50)}/hls/v\\d{13}-[0-9a-z]{8}/master\\.m3u8$`));
+  assert.deepEqual(auto.results.get(id(51)), { error: null, final: false });
+  assert.match(n8n.hls_url, new RegExp(`^${BASE}converted/${id(51)}/hls/v`));
+  assert.ok(objects.has(`${publishedPrefix(51)}master.m3u8`));
+
+  assert.equal(auto.results.get(id(52))!.final, true, 'a refusal is final');
+  assert.match(auto.results.get(id(52))!.error!, /^403 post is hidden/);
+  assert.equal(posts.get(id(52))!.hls_url, null);
+  assert.deepEqual(hlsKeys(52), []);
+
+  assert.equal(auto.results.get(id(53))!.final, false, 'a failed conversion may be retried');
+  assert.match(auto.results.get(id(53))!.error!, /^500 /);
+  assert.deepEqual(hlsKeys(53), [], 'a failed attempt leaves nothing');
+
+  assert.deepEqual(auto.results.get(id(54)), { error: null, final: false }, 'already published: nothing to do');
+  assert.equal(done.hls_url, `${BASE}converted/${id(54)}/hls/vx/master.m3u8`);
+  assert.deepEqual(hlsKeys(54), []);
+  assert.deepEqual(auto.results.get(id(55)), { error: 'post not found', final: true });
+});
+
+test('auto-convert: without the backend functions or a healthy queue it does nothing, and the rest keeps working', async () => {
+  faults.autoMissing = true;
+  seed(56);
+  auto.offer.push(id(56));
+  const before = auto.calls;
+  await sleep(700);
+  assert.ok(auto.calls > before, 'it keeps asking');
+  assert.equal(posts.get(id(56))!.hls_url, null);
+  assert.equal((await (await fetch(`http://127.0.0.1:${port}/health`)).json()).revocationQueue, 'ok');
+  faults.autoMissing = false;
+
+  faults.queueDown = true;
+  await sleep(1300);
+  const callsWhileDown = auto.calls;
+  await sleep(600);
+  assert.equal(auto.calls, callsWhileDown, 'no claims while the revocation queue is unhealthy');
+  faults.queueDown = false;
+  await until(() => auto.results.has(id(56)), 'converted once both are back', 30000);
+  assert.deepEqual(auto.results.get(id(56)), { error: null, final: false });
+  assert.ok(posts.get(id(56))!.hls_url);
 });

@@ -10,7 +10,8 @@ import { ensureDir, cleanup, generateTempDir, getFilenameWithoutExtension } from
 import { migrationConfig, resolutionSets } from './config/index.js';
 import { authenticate, isAuthEnabled } from './middleware/auth.js';
 import { PUBLIC_SOURCE_BUCKET, isUuid } from './services/hls-policy.js';
-import { HlsLifecycle } from './services/hls-lifecycle.js';
+import { HlsLifecycle, Outcome } from './services/hls-lifecycle.js';
+import { HlsAutoConvert } from './services/hls-autoconvert.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -196,6 +197,47 @@ const lifecycle = new HlsLifecycle(storageService, {
   batch: Number(process.env.HLS_RECONCILE_BATCH || 20),
   requireQueue: process.env.REQUIRE_REVOCATION_QUEUE !== 'false',
   healthMs: Number(process.env.HLS_QUEUE_HEALTH_MS || 300_000),
+});
+
+/**
+ * Convert [postId]'s own video from bucket/videoPath, under the lifecycle's
+ * policy. Shared by /api/process-from-storage and the auto-convert scan.
+ */
+async function convertFromStorage(postId: string, sourceBucket: string, videoPath: string): Promise<Outcome> {
+  let tempDir: string | null = null;
+  try {
+    return await lifecycle.convert(postId, sourceBucket, videoPath, async (attemptDir) => {
+      // The local copy gets a fixed name: ffmpeg's output paths are built from
+      // it, and a stored name with a space (n8n uploads) broke the segment path.
+      const ext = path.extname(videoPath);
+      const localName = `source${/^\.[A-Za-z0-9]{1,5}$/.test(ext) ? ext.toLowerCase() : '.mp4'}`;
+      const videoFile: VideoFile = { name: localName, path: videoPath, size: 0, bucket: sourceBucket };
+      tempDir = generateTempDir(migrationConfig.processing.tempDir, 'storage-process');
+      await ensureDir(tempDir);
+      const tempPath = path.join(tempDir, videoFile.name);
+      await storageService.downloadFile(videoFile, tempPath);
+      const result = await processVideo(tempPath, videoFile.name, attemptDir);
+      if (!result.success) {
+        throw new Error(result.error || 'conversion failed');
+      }
+      const files = result.outputFiles ?? [];
+      const master = files.find(f => f.endsWith('master.m3u8'));
+      if (!master) {
+        throw new Error('no master playlist was produced');
+      }
+      return { master, files, metadata: result.metadata, processingTime: result.processingTime };
+    });
+  } finally {
+    if (tempDir) {
+      await cleanup([tempDir]).catch(() => {});
+    }
+  }
+}
+
+/** Automatic conversion of new videos nobody asked HLS for (n8n, failed app requests). */
+const autoConvert = new HlsAutoConvert(storageService, convertFromStorage, () => lifecycle.queueHealthy(), {
+  intervalMs: Number(process.env.HLS_AUTOCONVERT_INTERVAL_MS ?? 600_000),
+  batch: Number(process.env.HLS_AUTOCONVERT_BATCH || 2),
 });
 
 // Routes
@@ -410,25 +452,8 @@ app.post('/api/process-from-storage', authenticate, express.json(), async (req: 
   }
   const sourceBucket: string = typeof bucket === 'string' && bucket ? bucket : PUBLIC_SOURCE_BUCKET;
 
-  let tempDir: string | null = null;
   try {
-    const outcome = await lifecycle.convert(postId.toLowerCase(), sourceBucket, videoPath, async (attemptDir) => {
-      const videoFile: VideoFile = { name: path.basename(videoPath), path: videoPath, size: 0, bucket: sourceBucket };
-      tempDir = generateTempDir(migrationConfig.processing.tempDir, 'storage-process');
-      await ensureDir(tempDir);
-      const tempPath = path.join(tempDir, videoFile.name);
-      await storageService.downloadFile(videoFile, tempPath);
-      const result = await processVideo(tempPath, videoFile.name, attemptDir);
-      if (!result.success) {
-        throw new Error(result.error || 'conversion failed');
-      }
-      const files = result.outputFiles ?? [];
-      const master = files.find(f => f.endsWith('master.m3u8'));
-      if (!master) {
-        throw new Error('no master playlist was produced');
-      }
-      return { master, files, metadata: result.metadata, processingTime: result.processingTime };
-    });
+    const outcome = await convertFromStorage(postId.toLowerCase(), sourceBucket, videoPath);
     if (outcome.status !== 200) {
       logger.warn(`process-from-storage: ${outcome.status} ${String(outcome.body.error ?? '')}`);
     }
@@ -439,10 +464,6 @@ app.post('/api/process-from-storage', authenticate, express.json(), async (req: 
       success: false,
       error: error instanceof Error ? error.message : 'Processing failed'
     });
-  } finally {
-    if (tempDir) {
-      await cleanup([tempDir]).catch(() => {});
-    }
   }
 });
 
@@ -529,6 +550,7 @@ app.use((req: Request, res: Response) => {
 // Start server
 app.listen(PORT, () => {
   lifecycle.start();
+  autoConvert.start();
   logger.info(`🚀 Video processing server running on port ${PORT}`);
   logger.info(`📁 Storage: ${migrationConfig.storage.targetBucket}/${migrationConfig.storage.targetFolder}`);
   logger.info(`🎬 FFmpeg ready for video processing`);
