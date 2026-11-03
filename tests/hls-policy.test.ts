@@ -1,8 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  Condition,
+  POST_COLUMNS,
   PostRow,
   conversionRefusal,
+  publishConditions,
   hlsFolderFor,
   isUuid,
   revokeRequired,
@@ -121,5 +124,16 @@ test('R3: the publishing UPDATE re-applies exactly the conversion policy', async
       const allowed = changed.hls_url === null && conversionRefusal(changed, bucket, objectPath, false, NOW) === null;
       assert.equal(rowMeets(changed, conds), allowed, `${JSON.stringify(m)} from ${start.media_path ? 'private' : 'legacy'}`);
     }
+  }
+});
+
+test('the publish selects every column its or= filters name (PostgREST filters the returned rows too)', () => {
+  const selected = new Set(POST_COLUMNS.split(',').map(c => c.trim()));
+  const orColumns = (conds: Condition[]): string[] =>
+    conds.flatMap(c => ('or' in c ? c.or.map(o => ('or' in o ? '' : String(o.col))) : []));
+  for (const post of [priv(), legacy()]) {
+    const cols = orColumns(publishConditions(post, NOW));
+    assert.ok(cols.length > 0);
+    for (const col of cols) assert.ok(selected.has(col), `${col} is filtered with or= but not selected`);
   }
 });
