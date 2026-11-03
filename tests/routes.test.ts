@@ -145,6 +145,20 @@ const mock = http.createServer(async (req, res) => {
     const rows = [...posts.values()].filter(r => matches(r, u.searchParams));
     if (req.method === 'GET') return send(200, rows);
     if (req.method === 'PATCH') {
+      // Real PostgREST (v12.2.12 and v13.0.7, checked 2026-11-03) also applies
+      // an or=(...) filter to the rows a mutation returns, so every column it
+      // names must be in select=, or the UPDATE fails with 42703. Production
+      // failed this way on every publish ("column posts.is_hidden does not
+      // exist"); the stand-in now does too.
+      const selected = new Set((u.searchParams.get('select') ?? '*').split(',').map(s => s.trim()));
+      for (const orExpr of u.searchParams.getAll('or')) {
+        for (const part of orExpr.replace(/^\(|\)$/g, '').split(',')) {
+          const col = part.slice(0, part.indexOf('.'));
+          if (!selected.has('*') && !selected.has(col)) {
+            return send(400, { code: '42703', message: `column posts.${col} does not exist` });
+          }
+        }
+      }
       sent.patches.push(pid);
       const mode = faults.patch.get(pid);
       if (mode === 'error') return send(500, { message: 'simulated database failure' });

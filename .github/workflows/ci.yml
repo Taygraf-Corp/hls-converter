@@ -9,7 +9,8 @@ name: CI
 #
 # Tests (node:test, `npm test`) cover the HLS policy and the conversion/revoke
 # routes against an in-memory Supabase stand-in with the bundled ffmpeg. They
-# make no network calls.
+# make no network calls. The postgrest job runs the publish UPDATE against real
+# PostgREST and Postgres service containers (no production access).
 
 on:
   pull_request:
@@ -52,3 +53,61 @@ jobs:
       - name: Typecheck infra (tsc --noEmit)
         run: npx tsc --noEmit
         working-directory: infra
+
+  postgrest:
+    # The route tests use an in-memory PostgREST stand-in. This job runs the
+    # publish UPDATE against real PostgREST (2026-11-03: the stand-in accepted
+    # a publish that production PostgREST rejected on every post).
+    name: Publish against real PostgREST ${{ matrix.postgrest }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        postgrest: ['v12.2.12', 'v13.0.7']
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+      postgrest:
+        image: postgrest/postgrest:${{ matrix.postgrest }}
+        env:
+          PGRST_DB_URI: postgres://postgres:postgres@postgres:5432/postgres
+          PGRST_DB_SCHEMAS: public
+          PGRST_DB_ANON_ROLE: postgres
+        ports: ['3000:3000']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies (service)
+        run: npm ci
+
+      - name: Create the test schema
+        run: psql "postgres://postgres:postgres@127.0.0.1:5432/postgres" -v ON_ERROR_STOP=1 -f tests/postgrest-live/schema.sql
+
+      - name: Wait until PostgREST serves the schema
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:3000/posts?select=id&limit=1' || true)
+            [ "$code" = 200 ] && exit 0
+            psql "postgres://postgres:postgres@127.0.0.1:5432/postgres" -c "notify pgrst, 'reload schema'" >/dev/null || true
+            sleep 2
+          done
+          echo "PostgREST did not serve public.posts (last status $code)"
+          exit 1
+
+      - name: Publish tests against real PostgREST
+        run: node --import tsx --test tests/postgrest-live.test.ts
+        env:
+          PGRST_LIVE_URL: http://127.0.0.1:3000
