@@ -201,6 +201,77 @@ class BackfillTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(f.sent, [("/api/revoke-hls", A)])
 
+    # Pilot controls (CTO, 2026-11-04).
+    def test_every_group_requires_a_public_type(self):
+        groups = bf.QUERY.split("union all")
+        self.assertEqual(len(groups), 3)
+        for g in groups:
+            self.assertIn("p.type in ('UNFILTERED', 'PUBLIC')", g)
+
+    def ids(self, *pids, comment=""):
+        f = os.path.join(self.dir, "ids.txt")
+        with open(f, "w") as fh:
+            fh.write("".join(f"{p}{comment}\n" for p in pids))
+        return f
+
+    def test_ids_file_sends_only_the_named_posts(self):
+        f = Fake([cand(A), cand(B), cand(C)], {A: (200, {"success": True}, True), C: (200, {"success": True}, True)})
+        code, out = run(f, "--apply", "--checkpoint", self.cp, "--ids-file", self.ids(C, A.upper(), comment="  # pilot"))
+        self.assertEqual(code, 0, out)
+        self.assertEqual([p for _, p in f.sent], [A, C], "candidate order, only the named ids")
+
+    def test_ids_file_with_a_post_that_is_not_a_candidate_sends_nothing(self):
+        f = Fake([cand(A)], {A: (200, {"success": True}, True)})
+        code, out = run(f, "--apply", "--checkpoint", self.cp, "--ids-file", self.ids(A, B))
+        self.assertIn("not current candidates", str(code))
+        self.assertEqual(f.sent, [])
+        self.assertFalse(os.path.exists(self.cp) and self.records(), "nothing recorded")
+
+    def test_ids_file_may_not_name_an_excluded_post(self):
+        ex = os.path.join(self.dir, "ex.txt")
+        open(ex, "w").write(f"{A}\n")
+        f = Fake([cand(A), cand(B)], {})
+        code, _ = run(f, "--apply", "--checkpoint", self.cp, "--exclude-file", ex, "--ids-file", self.ids(A, B))
+        self.assertIn("excluded", str(code))
+        self.assertEqual(f.sent, [])
+
+    def test_ids_file_rerun_skips_posts_already_done(self):
+        f = Fake([cand(A), cand(B)], {A: (200, {"success": True}, True), B: (200, {"success": True}, True)})
+        ids = self.ids(A, B)
+        self.assertEqual(run(f, "--apply", "--checkpoint", self.cp, "--ids-file", ids, "--limit", "1")[0], 0)
+        f.candidates = [cand(B)]  # A has HLS now, so it is no longer a candidate
+        code, out = run(f, "--apply", "--checkpoint", self.cp, "--ids-file", ids)
+        self.assertEqual(code, 0, out)
+        self.assertEqual([p for _, p in f.sent], [A, B])
+
+    def test_verify_each_checks_each_post_before_the_next(self):
+        f = Fake([cand(A), cand(B)], {A: (200, {"success": True}, True), B: (200, {"success": True}, True)})
+        code, out = run(f, "--apply", "--checkpoint", self.cp, "--verify-each")
+        self.assertEqual(code, 0, out)
+        ev = [(r["id"], r["event"]) for r in self.records()]
+        self.assertEqual(ev, [(A, "attempt"), (A, "reported"), (A, "done"), (B, "attempt"), (B, "reported"), (B, "done")])
+
+    def test_verify_each_stops_when_a_reported_success_is_not_in_the_database(self):
+        f = Fake([cand(A), cand(B)], {A: (200, {"success": True}, False), B: (200, {"success": True}, True)})
+        code, out = run(f, "--apply", "--checkpoint", self.cp, "--verify-each")
+        self.assertEqual(code, 1)
+        self.assertEqual([p for _, p in f.sent], [A], "B is never sent")
+        self.assertEqual(self.records()[-1], {**self.records()[-1], "id": A, "event": "unverified"})
+        self.assertIn("STOPPED", out)
+
+    def test_verify_each_stops_when_the_check_cannot_run(self):
+        f = Fake([cand(A), cand(B)], {A: (200, {"success": True}, True), B: (200, {"success": True}, True)})
+        real = f.query
+        def query(sql):
+            if "own_hls" in sql:
+                sys.exit("query failed")
+            return real(sql)
+        f.query = query
+        code, out = run(f, "--apply", "--checkpoint", self.cp, "--verify-each")
+        self.assertEqual(code, 1)
+        self.assertEqual([p for _, p in f.sent], [A])
+        self.assertEqual(self.records()[-1]["event"], "reported", "left unsettled for the next run")
+
 
 if __name__ == "__main__":
     unittest.main()

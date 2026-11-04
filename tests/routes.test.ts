@@ -58,6 +58,16 @@ const faults = {
   /** post ids whose result recording never gets an answer */
   hangResult: new Set<string>(),
 };
+/** ECS agent task-protection stand-in (PUT /task-protection/v1/state). */
+const agentTP = {
+  protected: false,
+  /** every request body, in order */
+  calls: [] as { ProtectionEnabled: boolean; ExpiresInMinutes?: number }[],
+  /** "<bucket>/<path>" of each source download, with the protection at that moment */
+  sourceReads: [] as { key: string; protected: boolean }[],
+  /** answer AccessDeniedException */
+  deny: false,
+};
 /** hls_claim_autoconvert stand-in: posts the database would offer, and the recorded results. */
 const auto = {
   offer: [] as string[],
@@ -138,6 +148,13 @@ const mock = http.createServer(async (req, res) => {
     res.end(JSON.stringify(data));
   };
   const raw = await readBody(req);
+  if (u.pathname === '/ecs-agent/task-protection/v1/state' && req.method === 'PUT') {
+    const body = JSON.parse(raw.toString());
+    agentTP.calls.push(body);
+    if (agentTP.deny) return send(400, { error: { Code: 'AccessDeniedException', Message: 'not authorized' } });
+    agentTP.protected = body.ProtectionEnabled === true;
+    return send(200, { protection: { ProtectionEnabled: agentTP.protected, ExpirationDate: agentTP.protected ? new Date(Date.now() + 60_000).toISOString() : null, TaskArn: 'arn:aws:ecs:test:task/c/t' } });
+  }
   const pid = (u.searchParams.get('id') ?? '').replace('eq.', '');
 
   if (u.pathname === '/rest/v1/posts') {
@@ -277,6 +294,7 @@ const mock = http.createServer(async (req, res) => {
       return send(200, prefixes.map((p: string) => ({ name: p })));
     }
     if (req.method === 'GET') {
+      if (!key.includes('/converted/')) agentTP.sourceReads.push({ key, protected: agentTP.protected });
       const delay = faults.slowGet.get(key);
       if (delay) await sleep(delay);
       const o = objects.get(key);
@@ -380,6 +398,10 @@ before(async () => {
       HLS_AUTOCONVERT_INTERVAL_MS: '200', HLS_AUTOCONVERT_BATCH: '2',
       HLS_AUTOCONVERT_LEASE_MS: '2000', HLS_AUTOCONVERT_TIMEOUT_MS: '4000',
       HLS_AUTOCONVERT_REQUEST_TIMEOUT_MS: '500', HLS_AUTOCONVERT_LATE_SWEEP_MS: '800',
+      ...(process.env.TEST_NO_TASK_PROTECTION ? {} : {
+        HLS_TASK_PROTECTION: 'on', ECS_AGENT_URI: `http://127.0.0.1:${mockPort}/ecs-agent`,
+        HLS_TASK_PROTECTION_RENEW_MS: '150', HLS_TASK_PROTECTION_EXPIRES_MIN: '5',
+      }),
     },
     stdio: ['ignore', 'ignore', 'inherit'],
   });
@@ -845,6 +867,50 @@ test('auto-convert P1: an upload that never answers is cut off, and a copy store
   const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
   assert.equal(health.autoConvert.background, 0, 'nothing of the attempt is still running');
   faults.hangUpload.clear();
+});
+
+test('scale-in protection: the task is protected before the source is read, renewed while converting, and cleared after', async () => {
+  const row = seed(70);
+  const key = `${row.media_bucket}/${row.media_path}`;
+  faults.slowGet.set(key, 700); // a conversion that spans several renewals
+  agentTP.calls.length = 0;
+  const r = await convert(70);
+  faults.slowGet.delete(key);
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  const read = agentTP.sourceReads.filter(x => x.key === key);
+  assert.equal(read.length, 1);
+  assert.equal(read[0].protected, true, 'protected when the work began');
+  assert.deepEqual(agentTP.calls[0], { ProtectionEnabled: true, ExpiresInMinutes: 5 });
+  assert.ok(agentTP.calls.filter(c => c.ProtectionEnabled).length >= 3, `renewed: ${JSON.stringify(agentTP.calls)}`);
+  await until(() => !agentTP.protected, 'protection cleared after the conversion');
+  assert.deepEqual(agentTP.calls.at(-1), { ProtectionEnabled: false });
+  const h = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+  assert.deepEqual(h.taskProtection, { state: 'idle', active: 0, expiresAt: null, lastError: null });
+});
+
+test('scale-in protection also covers auto-convert work', async () => {
+  const row = seed(71);
+  const key = `${row.media_bucket}/${row.media_path}`;
+  auto.offer.push(id(71));
+  await until(() => auto.results.has(id(71)), 'auto-convert result for 71', 20000);
+  assert.deepEqual(auto.results.get(id(71)), { error: null, final: false });
+  assert.equal(agentTP.sourceReads.filter(x => x.key === key).at(-1)!.protected, true);
+  await until(() => !agentTP.protected, 'protection cleared');
+});
+
+test('scale-in protection: an agent that refuses never blocks a conversion, and health reports it', async () => {
+  seed(72);
+  agentTP.deny = true;
+  try {
+    const r = await convert(72);
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.ok(posts.get(id(72))!.hls_url);
+    const h = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+    assert.equal(h.taskProtection.state, 'idle');
+    assert.match(h.taskProtection.lastError, /AccessDeniedException/);
+  } finally {
+    agentTP.deny = false;
+  }
 });
 
 test('health reports the auto-convert state for rollback checks', async () => {

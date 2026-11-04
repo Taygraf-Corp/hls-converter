@@ -25,7 +25,15 @@ Groups (conversion):
   unified       single-video posts with private media (unfiltered bucket), no hls_url
 Every group only includes posts the converter would accept: not hidden, not VIP,
 not expired (private media: no expiry at all), published in a feed, and the
-author has no account-deletion job.
+author has no account-deletion job. Every group also requires type UNFILTERED
+or PUBLIC: legacy PRIVATE posts are never sent (CTO, 2026-11-04), although the
+converter's legacy policy does not check type yet.
+
+Pilot runs (CTO, 2026-11-04): --ids-file names exactly the posts approved. The
+run refuses to send anything unless every named post is a current candidate,
+and nothing outside the file is ever sent. --verify-each checks each post in
+the database right after the converter reports it done, and stops before the
+next post when that check fails or cannot run.
 
 Sweep (--sweep): posts whose converted/<id>/hls/ copy must go (hidden, VIP,
 expired, unpublished, author being deleted) and copies whose post row is gone.
@@ -80,6 +88,7 @@ select g, id::text as id, bucket, path, created_at from (
     and p.video_url ~* '\\.(mp4|mov|m4v)(\\?|$)'
     and p.created_at >= '{since}'
     and (p.expires_at is null or p.expires_at > now())
+    and p.type in ('UNFILTERED', 'PUBLIC')
     and {eligible}
   union all
   select 'multiaccount', p.id, 'FlutterFlow',
@@ -89,6 +98,7 @@ select g, id::text as id, bucket, path, created_at from (
   where p.hls_url is null and p.media_path is null
     and p.video_url like '%/storage/v1/object/public/FlutterFlow/Videos/multi-account/%'
     and (p.expires_at is null or p.expires_at > now())
+    and p.type in ('UNFILTERED', 'PUBLIC')
     and {eligible}
   union all
   select 'unified', p.id, p.media_bucket, p.media_path, p.created_at
@@ -292,6 +302,9 @@ def main():
     ap.add_argument("--only", default="legacy,multiaccount,unified")
     ap.add_argument("--since", default="2026-10-27T00:00:00Z", help="legacy group start (UTC)")
     ap.add_argument("--exclude-file", help="post ids to skip, one per line (e.g. the VP9 repair targets)")
+    ap.add_argument("--ids-file", help="send only these post ids (an approved pilot list); every one must be a current candidate")
+    ap.add_argument("--verify-each", action="store_true",
+                    help="verify each post in the database before sending the next; stop if it is not verified")
     ap.add_argument("--limit", type=int, default=0, help="at most N requests this run")
     ap.add_argument("--pause", type=float, default=2.0, help="seconds between requests")
     ap.add_argument("--timeout", type=float, default=600.0,
@@ -316,6 +329,20 @@ def main():
         for line in open(a.exclude_file):
             exclude.update(m.lower() for m in UUID_ANY.findall(line))
 
+    only_ids = None
+    if a.ids_file:
+        only_ids = []
+        with open(a.ids_file) as fh:
+            for line in fh:
+                for m in UUID_ANY.findall(line.split("#", 1)[0]):
+                    if m.lower() not in only_ids:
+                        only_ids.append(m.lower())
+        if not only_ids:
+            sys.exit("--ids-file names no post ids")
+        clash = [i for i in only_ids if i in exclude]
+        if clash:
+            sys.exit(f"--ids-file names {len(clash)} excluded post(s): {', '.join(short(i) + '…' for i in clash)}")
+
     cp = Checkpoint(a.checkpoint) if a.checkpoint else None
     resubmit = reconcile(cp, mode, a) if (cp and a.apply) else set()
     settled = {i for i, r in (cp.last.items() if cp else []) if r["event"] in ("done", "refused")}
@@ -326,6 +353,13 @@ def main():
     else:
         rows = [{"g": r["reason"], "id": r["id"]} for r in mgmt_query(SWEEP_QUERY)
                 if r["reason"] and UUID.match(r["id"])]
+    if only_ids is not None:
+        present = {r["id"] for r in rows}
+        missing = [i for i in only_ids if i not in present and i not in settled]
+        if missing:
+            sys.exit(f"stopping, nothing sent: {len(missing)} post(s) in --ids-file are not current candidates: "
+                     f"{', '.join(short(i) + '…' for i in missing)}")
+        rows = [r for r in rows if r["id"] in only_ids]
     rows = [r for r in rows if r["id"] not in exclude and r["id"] not in settled
             and (r["id"] not in (cp.unsettled() if cp else {}) or r["id"] in resubmit)]
     if a.limit:
@@ -363,7 +397,22 @@ def main():
         msg = str(body.get("error", ""))[:100]
         print(f"[{i}/{len(rows)}] {r['g']:24} post {short(r['id'])}…  -> {status or 'no answer'} {outcome} {msg}")
         if outcome == "reported":
-            done.append(r["id"])
+            if a.verify_each:
+                try:
+                    row = verify_rows([r["id"]]).get(r["id"])
+                except BaseException as e:  # noqa: B902 - includes the SystemExit of a failed query
+                    print(f"VERIFICATION COULD NOT RUN ({type(e).__name__}) for post {short(r['id'])}…; "
+                          "it stays unsettled and nothing more is sent.")
+                    return 1
+                ok = (row is not None and row["own_hls"]) if mode == "convert" else (row is None or not row["has_hls"])
+                cp.write({"id": r["id"], "event": "done" if ok else "unverified"})
+                print(f"        verified in the database: {'yes' if ok else 'NO'}")
+                if not ok:
+                    print(f"STOPPED: post {short(r['id'])}… was reported done but is not in the database. "
+                          "Nothing more is sent.")
+                    return 1
+            else:
+                done.append(r["id"])
         if outcome == UNCERTAIN:
             stopped = r["id"]
             break

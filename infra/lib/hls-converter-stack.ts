@@ -172,6 +172,13 @@ export class HlsConverterStack extends cdk.Stack {
       },
     });
 
+    // Scale-in protection while a conversion runs (src/services/task-protection.ts,
+    // used only when HLS_TASK_PROTECTION=on). Limited to this cluster's tasks.
+    taskDefinition.addToTaskRolePolicy(new iam.PolicyStatement({
+      actions: ['ecs:UpdateTaskProtection', 'ecs:GetTaskProtection'],
+      resources: [`arn:aws:ecs:${this.region}:${this.account}:task/${this.cluster.clusterName}/*`],
+    }));
+
     container.addPortMappings({
       containerPort: 3000,
       protocol: ecs.Protocol.TCP,

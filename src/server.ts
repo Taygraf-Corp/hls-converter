@@ -12,6 +12,7 @@ import { authenticate, isAuthEnabled } from './middleware/auth.js';
 import { PUBLIC_SOURCE_BUCKET, isUuid } from './services/hls-policy.js';
 import { HlsLifecycle, Outcome } from './services/hls-lifecycle.js';
 import { HlsAutoConvert } from './services/hls-autoconvert.js';
+import { TaskProtection } from './services/task-protection.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -225,6 +226,18 @@ function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
 }
 
 /**
+ * ECS scale-in protection while any conversion runs in this task. Off unless
+ * HLS_TASK_PROTECTION=on (the task role then needs ecs:UpdateTaskProtection).
+ */
+const taskProtection = new TaskProtection({
+  agentUri: process.env.ECS_AGENT_URI,
+  enabled: process.env.HLS_TASK_PROTECTION === 'on',
+  expiresInMinutes: Number(process.env.HLS_TASK_PROTECTION_EXPIRES_MIN || 45),
+  renewMs: Number(process.env.HLS_TASK_PROTECTION_RENEW_MS || 600_000),
+  maxHoldMs: Number(process.env.HLS_TASK_PROTECTION_MAX_HOLD_MS || 3_600_000),
+});
+
+/**
  * Convert [postId]'s own video from bucket/videoPath, under the lifecycle's
  * policy. Shared by /api/process-from-storage and the auto-convert scan.
  * [signal] cancels the work (ffmpeg is killed and awaited, nothing more is
@@ -233,7 +246,17 @@ function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
  * folder for the caller to run later: an upload whose request was aborted may
  * still have been stored (CTO re-review P1).
  */
-async function convertFromStorage(
+function convertFromStorage(
+  postId: string,
+  sourceBucket: string,
+  videoPath: string,
+  signal?: AbortSignal,
+  onLateWork?: (work: () => Promise<unknown>) => void,
+): Promise<Outcome> {
+  return taskProtection.hold(() => convertUnprotected(postId, sourceBucket, videoPath, signal, onLateWork));
+}
+
+async function convertUnprotected(
   postId: string,
   sourceBucket: string,
   videoPath: string,
@@ -332,6 +355,8 @@ app.get('/health', (req: Request, res: Response) => {
     // 'off' | 'idle' | 'working', and auto-convert work still settling after a
     // cancellation. Before rolling back: 'off' or 'idle', and 0.
     autoConvert: autoConvert.status(),
+    // 'off' | 'idle' | 'protected' | 'unprotected' (work running, agent request failed).
+    taskProtection: taskProtection.status(),
     timestamp: new Date().toISOString()
   });
 });
@@ -625,6 +650,10 @@ app.use((req: Request, res: Response) => {
 app.listen(PORT, () => {
   lifecycle.start();
   autoConvert.start();
+  if (taskProtection.configured) {
+    const t = taskProtection.settings();
+    logger.info(`🛡️  Task scale-in protection: ON while converting (expiry ${t.expiresInMinutes} min, renew ${t.renewMs} ms, max hold ${t.maxHoldMs} ms)`);
+  }
   logger.info(`🚀 Video processing server running on port ${PORT}`);
   logger.info(`📁 Storage: ${migrationConfig.storage.targetBucket}/${migrationConfig.storage.targetFolder}`);
   logger.info(`🎬 FFmpeg ready for video processing`);
