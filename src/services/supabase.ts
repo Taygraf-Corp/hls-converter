@@ -151,6 +151,20 @@ export class SupabaseStorageService {
     return (data ?? []).length > 0;
   }
 
+  /** Up to [limit] posts other than [postId] whose hls_url points into [folder]. */
+  async otherPostsUsingFolder(postId: string, folder: string, limit: number): Promise<string[]> {
+    const { data, error } = await this.adminClient
+      .from('posts')
+      .select('id')
+      .neq('id', postId)
+      .like('hls_url', `%/${folder}/%`)
+      .limit(limit);
+    if (error) {
+      throw new Error(`Failed to check folder use: ${error.message}`);
+    }
+    return (data ?? []).map((r: { id: string }) => r.id);
+  }
+
   /** Every object under [prefix], recursively, with its last-modified time. */
   async listTree(prefix: string, bucket?: string): Promise<{ path: string; modifiedAt: number }[]> {
     const targetBucket = bucket || migrationConfig.storage.targetBucket;

@@ -40,6 +40,8 @@ export interface HlsStore {
   getHlsUrl(postId: string): Promise<string | null | undefined>;
   clearHlsUrl(postId: string, hlsUrl: string): Promise<void>;
   otherPostUsesFolder(postId: string, folder: string): Promise<boolean>;
+  /** Up to [limit] posts other than [postId] whose hls_url points into [folder]. */
+  otherPostsUsingFolder(postId: string, folder: string, limit: number): Promise<string[]>;
   listTree(prefix: string): Promise<{ path: string; modifiedAt: number }[]>;
   removeObjects(paths: string[]): Promise<number>;
   removeTree(prefix: string): Promise<number>;
@@ -216,7 +218,7 @@ export class HlsLifecycle {
     let removed = 0;
     let kept: string | undefined;
     for (const folder of roots) {
-      if (await this.store.otherPostUsesFolder(postId, folder)) {
+      if (await this.eligiblePostUsesFolder(postId, folder)) {
         kept = 'another post plays HLS from this folder';
         continue;
       }
@@ -226,6 +228,26 @@ export class HlsLifecycle {
       await this.store.clearHlsUrl(postId, post.hls_url);
     }
     return { revoked: true, removed, kept };
+  }
+
+  /**
+   * Whether a post other than [postId] that may itself keep HLS plays from
+   * [folder]. Posts that must lose their own HLS (hidden, VIP, legacy PRIVATE,
+   * ...) do not keep a folder alive (CTO 2026-11-04): otherwise two such
+   * posts sharing one folder would each keep it for the other forever. Their
+   * hls_url is cleared by their own revocation; the reconcile scan queues
+   * every ineligible post that still has one. Conservative when unsure: too
+   * many users, or a read that fails, keeps the folder or fails the revoke.
+   */
+  private async eligiblePostUsesFolder(postId: string, folder: string): Promise<boolean> {
+    const limit = 50;
+    const users = await this.store.otherPostsUsingFolder(postId, folder, limit);
+    if (users.length >= limit) return true;
+    for (const other of users) {
+      const { post, deletionPending } = await this.loadPolicyInputs(other);
+      if (post && !revokeRequired(post, deletionPending)) return true;
+    }
+    return false;
   }
 
   /**

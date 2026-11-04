@@ -721,6 +721,67 @@ test('revoking a hidden legacy post also removes a copy it alone plays from anot
   assert.equal(row.hls_url, null);
 });
 
+test('CTO 2026-11-04: a legacy PRIVATE post is never converted, and loses an existing copy', async () => {
+  const legacyPriv = (n: number, over: Row = {}) => seed(n, {
+    media_bucket: null, media_path: null, type: 'PRIVATE',
+    video_url: `https://ref.supabase.co/storage/v1/object/public/FlutterFlow/Videos/${n}.mp4`, ...over,
+  });
+  legacyPriv(80);
+  objects.set('FlutterFlow/Videos/80.mp4', { data: clip, modifiedAt: Date.now() });
+  const r = await call('/api/process-from-storage', { postId: id(80), videoPath: 'Videos/80.mp4' });
+  assert.equal(r.status, 403, JSON.stringify(r.json));
+  assert.match(r.json.error, /access type/);
+  assert.deepEqual(hlsKeys(80), []);
+
+  // An older copy in its own folder is revoked like any ineligible post's.
+  const row = legacyPriv(81, { hls_url: `${BASE}converted/${id(81)}/hls/vx/master.m3u8` });
+  objects.set(`FlutterFlow/converted/${id(81)}/hls/vx/master.m3u8`, { data: Buffer.from('#EXTM3U'), modifiedAt: Date.now() });
+  const v = await call('/api/revoke-hls', { postId: id(81) });
+  assert.equal(v.status, 200, JSON.stringify(v.json));
+  assert.deepEqual(hlsKeys(81), []);
+  assert.equal(row.hls_url, null);
+
+  // A legacy PUBLIC post is unaffected.
+  const pub = legacyPriv(82, { type: 'PUBLIC', hls_url: `${BASE}converted/${id(82)}/hls/vx/master.m3u8` });
+  objects.set(`FlutterFlow/converted/${id(82)}/hls/vx/master.m3u8`, { data: Buffer.from('#EXTM3U'), modifiedAt: Date.now() });
+  assert.equal((await call('/api/revoke-hls', { postId: id(82) })).status, 409);
+  assert.equal(hlsKeys(82).length, 1);
+  assert.ok(pub.hls_url);
+});
+
+test('CTO 2026-11-04: posts that must lose HLS do not keep a shared folder alive for each other', async () => {
+  // The production case: hidden 4df776b0 and legacy PRIVATE 3a2b1a27 share
+  // converted/1755737666591/; each used to keep it for the other.
+  const folderUrl = `${BASE}converted/1755737666591/hls/master.m3u8`;
+  const mk = (n: number, over: Row) => seed(n, {
+    media_bucket: null, media_path: null, video_url: 'https://ref.supabase.co/storage/v1/object/public/FlutterFlow/Videos/1755737666591.mp4',
+    hls_url: folderUrl, ...over,
+  });
+  const hidden = mk(83, { type: 'PUBLIC', is_hidden: true });
+  const priv = mk(84, { type: 'PRIVATE' });
+  objects.set('FlutterFlow/converted/1755737666591/hls/master.m3u8', { data: Buffer.from('#EXTM3U'), modifiedAt: Date.now() });
+  const a = await call('/api/revoke-hls', { postId: id(83) });
+  assert.equal(a.status, 200, JSON.stringify(a.json));
+  assert.equal(objects.has('FlutterFlow/converted/1755737666591/hls/master.m3u8'), false, 'no eligible post needs the folder');
+  assert.equal(hidden.hls_url, null);
+  const b = await call('/api/revoke-hls', { postId: id(84) });
+  assert.equal(b.status, 200, JSON.stringify(b.json));
+  assert.equal(priv.hls_url, null);
+
+  // An eligible PUBLIC sharer still keeps the folder (the VIP 853208e4 /
+  // PUBLIC 7eb01369 case).
+  const shared = `${BASE}converted/1741098607232/hls/master.m3u8`;
+  const vip = mk(85, { type: 'PUBLIC', is_vip: true, hls_url: shared, video_url: 'https://ref.supabase.co/storage/v1/object/public/FlutterFlow/Videos/1741098607232.mp4' });
+  const pub = mk(86, { type: 'PUBLIC', hls_url: shared, video_url: 'https://ref.supabase.co/storage/v1/object/public/FlutterFlow/Videos/1741098607232.mp4' });
+  objects.set('FlutterFlow/converted/1741098607232/hls/master.m3u8', { data: Buffer.from('#EXTM3U'), modifiedAt: Date.now() });
+  const c = await call('/api/revoke-hls', { postId: id(85) });
+  assert.equal(c.status, 409, JSON.stringify(c.json));
+  assert.match(c.json.error, /kept/);
+  assert.equal(objects.has('FlutterFlow/converted/1741098607232/hls/master.m3u8'), true, 'the PUBLIC post still plays from it');
+  assert.equal(vip.hls_url, shared, 'kept folder: the VIP row is left for review, as before');
+  assert.equal(pub.hls_url, shared);
+});
+
 test('auto-convert: new videos nobody asked HLS for are converted from their own row, under the same policy', async () => {
   const unified = seed(50);
   const n8n = seed(51, {
