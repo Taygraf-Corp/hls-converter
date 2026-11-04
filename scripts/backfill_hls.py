@@ -31,7 +31,8 @@ converter's legacy policy does not check type yet.
 
 Pilot runs (CTO, 2026-11-04): --ids-file names exactly the posts approved. The
 run refuses to send anything unless every named post is a current candidate,
-and nothing outside the file is ever sent. --verify-each checks each post in
+and nothing outside the file is ever sent; a refusal of a named post stops
+the run. --verify-each checks each post in
 the database right after the converter reports it done, and stops before the
 next post when that check fails or cannot run.
 
@@ -385,7 +386,7 @@ def main():
         sys.exit("set HLS_API_KEY (the converter key) in the environment; it is never printed")
 
     route = "/api/revoke-hls" if mode == "sweep" else "/api/process-from-storage"
-    done, results, stopped = [], {}, None
+    done, results, stopped, refused_stop = [], {}, None, None
     for i, r in enumerate(rows, 1):
         payload = ({"postId": r["id"]} if mode == "sweep" else
                    {"videoPath": r["path"], "bucket": r["bucket"], "videoId": r["id"], "postId": r["id"]})
@@ -416,6 +417,12 @@ def main():
         if outcome == UNCERTAIN:
             stopped = r["id"]
             break
+        if outcome == "refused" and only_ids is not None:
+            # An approved post the converter will not convert: the pilot's
+            # assumptions were wrong, so nothing more is sent.
+            print(f"STOPPED: post {short(r['id'])}… from --ids-file was refused ({status}). Nothing more is sent.")
+            refused_stop = r["id"]
+            break
         time.sleep(a.pause)
     print(f"outcomes: {results}")
 
@@ -443,7 +450,7 @@ def main():
     if stopped:
         print(f"STOPPED on an uncertain outcome for post {short(stopped)}…. It stays unsettled in "
               f"{a.checkpoint}; the next run reconciles it before sending anything.")
-    return 1 if (stopped or failed) else 0
+    return 1 if (stopped or failed or refused_stop) else 0
 
 
 if __name__ == "__main__":

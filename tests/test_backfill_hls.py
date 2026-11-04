@@ -244,6 +244,13 @@ class BackfillTest(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual([p for _, p in f.sent], [A, B])
 
+    def test_ids_file_a_refused_post_stops_the_pilot(self):
+        f = Fake([cand(A), cand(B)], {A: (403, {"error": "post is hidden"}, None), B: (200, {"success": True}, True)})
+        code, out = run(f, "--apply", "--checkpoint", self.cp, "--ids-file", self.ids(A, B))
+        self.assertEqual(code, 1)
+        self.assertEqual([p for _, p in f.sent], [A])
+        self.assertIn("STOPPED", out)
+
     def test_verify_each_checks_each_post_before_the_next(self):
         f = Fake([cand(A), cand(B)], {A: (200, {"success": True}, True), B: (200, {"success": True}, True)})
         code, out = run(f, "--apply", "--checkpoint", self.cp, "--verify-each")
