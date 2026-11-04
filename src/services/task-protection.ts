@@ -21,11 +21,20 @@
  * waits until the protection is cleared or expires), so a rollout while a
  * conversion runs finishes once that conversion ends.
  *
+ * Fresh work never trusts an old protection (CTO review 2026-11-04, defect 1):
+ * the expiry is tracked locally from when each enable was sent, and a new
+ * conversion re-enables unless the protection still has more than one
+ * renewal period (plus a request timeout) left. status() reports
+ * 'unprotected' once the tracked expiry has passed.
+ *
  * Best effort: a failed or slow agent request (no permission, no agent,
  * throttled) is logged and shown in status(); the conversion itself always
  * runs and its result or error is returned unchanged. Each request is
- * aborted after requestTimeoutMs, and only the enable request is waited for
- * before the work starts.
+ * aborted after requestTimeoutMs. A conversion waits for protection at most
+ * requestTimeoutMs from its own start, however many others are starting or
+ * however many requests are queued (defect 2); conversions that start while
+ * an enable is in flight share it, and a renewal is skipped while a request
+ * is still running.
  *
  * Off unless HLS_TASK_PROTECTION=on and ECS_AGENT_URI is set (ECS sets it in
  * every task). The task role needs ecs:UpdateTaskProtection and
@@ -78,6 +87,11 @@ export class TaskProtection {
   /** What the agent last confirmed: true protected, false cleared, null unknown. */
   private applied: boolean | null = false;
   private expiresAt: string | null = null;
+  /** Local deadline of the confirmed protection (from when the enable was sent); 0 when none. */
+  private protectedUntil = 0;
+  /** The enable that starting conversions share, while it is queued or running. */
+  private enabling: Promise<void> | null = null;
+  private inflight = false;
   private lastError: string | null = null;
 
   constructor(opts: TaskProtectionOptions) {
@@ -106,8 +120,9 @@ export class TaskProtection {
   status(): TaskProtectionStatus {
     if (!this.url) return { state: 'off', active: 0, expiresAt: null, lastError: null };
     const active = this.holds.size;
-    const state = active === 0 ? 'idle' : this.applied === true ? 'protected' : 'unprotected';
-    return { state, active, expiresAt: this.applied === true ? this.expiresAt : null, lastError: this.lastError };
+    const live = this.applied === true && this.now() < this.protectedUntil;
+    const state = active === 0 ? 'idle' : live ? 'protected' : 'unprotected';
+    return { state, active, expiresAt: live ? this.expiresAt : null, lastError: this.lastError };
   }
 
   /**
@@ -119,10 +134,14 @@ export class TaskProtection {
     const id = this.nextId++;
     this.holds.set(id, this.now());
     if (!this.timer) {
-      this.timer = setInterval(() => void this.sync(true), this.renewMs);
+      this.timer = setInterval(() => { if (!this.inflight) void this.sync(true); }, this.renewMs);
       this.timer.unref?.();
     }
-    await this.sync(false);
+    if (!this.enabling) {
+      const e: Promise<void> = this.sync(false).finally(() => { if (this.enabling === e) this.enabling = null; });
+      this.enabling = e;
+    }
+    await this.bounded(this.enabling);
     try {
       return await work();
     } finally {
@@ -142,6 +161,18 @@ export class TaskProtection {
       c = this.chain;
       await c;
     } while (c !== this.chain);
+  }
+
+  /** Waits for [p], at most requestTimeoutMs. */
+  private bounded(p: Promise<void>): Promise<void> {
+    let t: NodeJS.Timeout | undefined;
+    const limit = new Promise<void>(resolve => { t = setTimeout(resolve, this.requestTimeoutMs); });
+    return Promise.race([p, limit]).finally(() => clearTimeout(t));
+  }
+
+  /** The protection outlasts the next renewal, so new work may rely on it. */
+  private fresh(): boolean {
+    return this.applied === true && this.protectedUntil - this.now() > this.renewMs + this.requestTimeoutMs;
   }
 
   /** Brings the agent to the wanted state; [renew] re-sends an enable. Requests never overlap. */
@@ -164,7 +195,7 @@ export class TaskProtection {
       return;
     }
     if (this.wanted()) {
-      if (renew || this.applied !== true) await this.put(true);
+      if (renew || !this.fresh()) await this.put(true);
     } else if (renew) {
       // Every running conversion is past maxHoldMs: stop renewing and let the
       // protection lapse at its expiry. It is cleared when the work ends.
@@ -174,6 +205,8 @@ export class TaskProtection {
 
   private async put(enable: boolean): Promise<void> {
     const body = enable ? { ProtectionEnabled: true, ExpiresInMinutes: this.expiresInMinutes } : { ProtectionEnabled: false };
+    const sentAt = this.now();
+    this.inflight = true;
     try {
       const res = await this.fetchImpl(this.url as string, {
         method: 'PUT',
@@ -188,6 +221,7 @@ export class TaskProtection {
       if (res.ok && p && p.ProtectionEnabled === enable) {
         this.applied = enable;
         this.expiresAt = enable ? (p.ExpirationDate ?? null) : null;
+        this.protectedUntil = enable ? sentAt + this.expiresInMinutes * 60_000 : 0;
         this.lastError = null;
         return;
       }
@@ -200,6 +234,8 @@ export class TaskProtection {
       // clear at the next change; the expiry bounds either way.
       this.applied = enable ? (this.applied === true ? true : null) : null;
       logger.warn(`Task protection ${enable ? 'enable' : 'clear'} failed: ${msg}`);
+    } finally {
+      this.inflight = false;
     }
   }
 }

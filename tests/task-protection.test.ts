@@ -178,8 +178,14 @@ for (const fail of ['http', 'error-json', 'failure-json', 'throw', 'hang'] as co
     assert.equal(r, 'ok');
     assert.ok(Date.now() - t0 < 1000, 'the work was not held up');
     assert.equal(status.state, 'unprotected');
-    assert.match(status.lastError, fail === 'hang' ? /^enable: timeout$/ :
-      fail === 'error-json' ? /AccessDeniedException/ : fail === 'failure-json' ? /TASK_NOT_VALID/ : /^enable: /);
+    if (fail === 'hang') {
+      // The work is released at the timeout itself, so the error may only be
+      // recorded just after it started.
+      await p.settled();
+      assert.match(p.status().lastError!, /: timeout$/);
+    } else {
+      assert.match(status.lastError, fail === 'error-json' ? /AccessDeniedException/ : fail === 'failure-json' ? /TASK_NOT_VALID/ : /^enable: /);
+    }
     await p.settled();
     assert.equal(p.status().state, 'idle');
   });
@@ -193,4 +199,76 @@ test('the work\'s own error is passed through unchanged, and the task is still c
   await p.settled();
   assert.equal(a.state, false);
   assert.equal(p.status().active, 0);
+});
+
+// CTO review 2026-11-04 (6c NO-GO), defect 1: after the protection has
+// expired, fresh work must acquire it again instead of trusting the old
+// "protected" state.
+test('regression: after the protection expires, new work acquires it again before starting', async () => {
+  let clock = 1_000_000;
+  let expiresAt = 0; // the agent's own expiry, on the same clock
+  let state = false;
+  const calls: any[] = [];
+  const fetchImpl = (async (_url: string, init: any) => {
+    const body = JSON.parse(init.body);
+    calls.push(body);
+    state = body.ProtectionEnabled;
+    expiresAt = state ? clock + body.ExpiresInMinutes * 60_000 : 0;
+    return new Response(JSON.stringify({ protection: { ProtectionEnabled: state, ExpirationDate: new Date(expiresAt).toISOString() } }), { status: 200 });
+  }) as unknown as typeof fetch;
+  const protectedNow = () => state && clock < expiresAt;
+  const p = new TaskProtection({
+    enabled: true, agentUri: URI, expiresInMinutes: 1, renewMs: 20, maxHoldMs: 30_000, fetchImpl, now: () => clock,
+  });
+
+  // A stuck conversion: past maxHoldMs it is no longer renewed, and the
+  // agent's protection then lapses.
+  let finish!: () => void;
+  const stuck = p.hold(() => new Promise<void>(r => { finish = r; }));
+  await sleep(30);
+  assert.equal(protectedNow(), true);
+  clock += 120_000; // past maxHoldMs and past the 1-minute expiry
+  await sleep(60);
+  assert.equal(protectedNow(), false, 'the agent protection has expired');
+  assert.equal(p.status().state, 'unprotected', 'status does not claim protection that has expired');
+
+  const before = calls.length;
+  let during: boolean | null = null;
+  await p.hold(async () => { during = protectedNow(); });
+  assert.ok(calls.length > before, 'an enable was sent for the new work');
+  assert.equal(during, true, 'the new work ran protected');
+
+  // Also: protection close to expiry is renewed before new work starts.
+  clock = expiresAt - 1_000; // 1 s left, less than a renewal period away
+  const before2 = calls.length;
+  await p.hold(async () => { during = protectedNow(); });
+  assert.ok(calls.length > before2, 'nearly expired protection is renewed for new work');
+  finish();
+  await stuck;
+  await p.settled();
+});
+
+// Defect 2: concurrent conversions must not queue up behind each other's
+// hung agent requests; each waits at most requestTimeoutMs from its own start.
+test('regression: concurrent conversions with a hung agent each wait at most one request timeout', async () => {
+  const a = agent({ fail: 'hang' });
+  const p = new TaskProtection({ enabled: true, agentUri: URI, requestTimeoutMs: 120, fetchImpl: a.fetchImpl });
+  const waits: number[] = [];
+  const run = () => {
+    const t0 = Date.now();
+    return p.hold(async () => { waits.push(Date.now() - t0); await sleep(50); });
+  };
+  await Promise.all([run(), run(), run(), run()]);
+  assert.equal(waits.length, 4);
+  for (const w of waits) assert.ok(w < 250, `each conversion started within one timeout: ${waits.join(', ')} ms`);
+  assert.ok(enables(a.calls) <= 2, `concurrent starts share one enable request: ${enables(a.calls)}`);
+
+  // Later arrivals while a request is hanging are bounded the same way.
+  const late: Promise<void>[] = [];
+  const first = run();
+  await sleep(60);
+  late.push(run());
+  await Promise.all([first, ...late]);
+  for (const w of waits.slice(4)) assert.ok(w < 250, `late arrival bounded: ${waits.join(', ')} ms`);
+  await p.settled();
 });
