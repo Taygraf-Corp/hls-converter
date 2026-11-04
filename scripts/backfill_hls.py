@@ -134,7 +134,7 @@ select f.fid as id,
     when p.media_path is null and p.expires_at is not null and p.expires_at <= now() then 'expired'
     when p.media_path is not null and coalesce(p.media_count, 1) <> 1 then 'carousel'
     when p.media_path is not null and not (p.channel = 'unfiltered' or p.in_general_feed is true) then 'unpublished'
-    when p.media_path is not null and p.type not in ('UNFILTERED', 'PUBLIC') then 'access type'
+    when p.type not in ('UNFILTERED', 'PUBLIC') then 'access type'
     else null
   end as reason
 from folders f

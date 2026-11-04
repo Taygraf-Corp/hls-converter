@@ -208,6 +208,11 @@ class BackfillTest(unittest.TestCase):
         for g in groups:
             self.assertIn("p.type in ('UNFILTERED', 'PUBLIC')", g)
 
+    def test_sweep_lists_legacy_private_copies(self):
+        # CTO 2026-11-04: the access-type reason covers legacy posts too.
+        self.assertIn("when p.type not in ('UNFILTERED', 'PUBLIC') then 'access type'", bf.SWEEP_QUERY)
+        self.assertNotIn("p.media_path is not null and p.type not in", bf.SWEEP_QUERY)
+
     def ids(self, *pids, comment=""):
         f = os.path.join(self.dir, "ids.txt")
         with open(f, "w") as fh:
