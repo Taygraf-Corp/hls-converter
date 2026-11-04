@@ -30,8 +30,17 @@ export class FFmpegService {
           return;
         }
 
-        const width = videoStream.width;
-        const height = videoStream.height;
+        let width = videoStream.width;
+        let height = videoStream.height;
+
+        // Prefer display orientation (rotation tag / side data) over coded size.
+        const rotation = this.getRotationDegrees(videoStream);
+        if (rotation === 90 || rotation === 270) {
+          const tmp = width;
+          width = height;
+          height = tmp;
+        }
+
         const duration = typeof metadata.format.duration === 'number' 
           ? metadata.format.duration 
           : parseFloat(metadata.format.duration || '0');
@@ -55,21 +64,61 @@ export class FFmpegService {
   /**
    * Detect aspect ratio category based on video dimensions
    */
+  /**
+   * Read rotation degrees from stream tags or side_data when present.
+   */
+  private getRotationDegrees(videoStream: any): number {
+    const tagRotation = videoStream?.tags?.rotate ?? videoStream?.tags?.rotation;
+    if (tagRotation != null && tagRotation !== '') {
+      const parsed = parseInt(String(tagRotation), 10);
+      if (!Number.isNaN(parsed)) {
+        return ((parsed % 360) + 360) % 360;
+      }
+    }
+
+    const sideData = videoStream?.side_data_list;
+    if (Array.isArray(sideData)) {
+      for (const entry of sideData) {
+        if (entry?.rotation != null) {
+          const parsed = parseInt(String(entry.rotation), 10);
+          if (!Number.isNaN(parsed)) {
+            return ((parsed % 360) + 360) % 360;
+          }
+        }
+      }
+    }
+
+    return 0;
+  }
+
   private detectAspectRatio(width: number, height: number): AspectRatio {
     const ratio = width / height;
-    
-    // Define thresholds for aspect ratio detection
-    const PORTRAIT_THRESHOLD = 0.75;  // 3:4 and narrower (including 9:16)
-    const SQUARE_THRESHOLD_LOW = 0.9; // Close to square
-    const SQUARE_THRESHOLD_HIGH = 1.1; // Close to square
-    
-    if (ratio < PORTRAIT_THRESHOLD) {
+
+    // Treat anything taller than wide (incl. 4:5 = 0.8) as portrait.
+    // Previous PORTRAIT_THRESHOLD of 0.75 mis-labeled 4:5 as landscape, which
+    // force-scaled portrait uploads into 16:9 HLS and stretched playback.
+    const SQUARE_THRESHOLD_LOW = 0.9;
+    const SQUARE_THRESHOLD_HIGH = 1.1;
+
+    if (ratio < SQUARE_THRESHOLD_LOW) {
       return 'portrait';
-    } else if (ratio >= SQUARE_THRESHOLD_LOW && ratio <= SQUARE_THRESHOLD_HIGH) {
+    } else if (ratio <= SQUARE_THRESHOLD_HIGH) {
       return 'square';
     } else {
       return 'landscape';
     }
+  }
+
+  /**
+   * Fill target size without anamorphic stretch (center-crop).
+   * Prefer crop over pad so portrait feeds don't show black bars.
+   */
+  private scaleCropFilter(resolution: Resolution): string {
+    const { width, height } = resolution;
+    return (
+      `scale=${width}:${height}:force_original_aspect_ratio=increase,` +
+      `crop=${width}:${height},setsar=1`
+    );
   }
 
   /**
@@ -143,7 +192,8 @@ export class FFmpegService {
     inputPath: string,
     outputDir: string,
     options: ConversionOptions,
-    onProgress?: (progress: number) => void
+    onProgress?: (progress: number) => void,
+    signal?: AbortSignal
   ): Promise<string[]> {
     try {
       // Ensure output directory exists
@@ -171,7 +221,8 @@ export class FFmpegService {
           path.join(outputDir, segmentPattern),
           resolution,
           options,
-          onProgress ? (p) => onProgress((i + p / 100) / options.resolutions.length * 100) : undefined
+          onProgress ? (p) => onProgress((i + p / 100) / options.resolutions.length * 100) : undefined,
+          signal
         );
         
         outputFiles.push(variantPlaylist);
@@ -256,7 +307,7 @@ export class FFmpegService {
         command.outputOptions([
           `-c:v:${index}`, 'libx264',
           `-b:v:${index}`, resolution.bitrate.toString(),
-          `-s:v:${index}`, `${resolution.width}x${resolution.height}`,
+          `-filter:v:${index}`, this.scaleCropFilter(resolution),
           `-profile:v:${index}`, 'main',
           `-level:v:${index}`, '3.1'
         ]);
@@ -329,7 +380,7 @@ export class FFmpegService {
           '-seg_duration', options.cmafFragmentDuration.toString(),
           '-c:v', 'libx264',
           '-b:v', targetResolution.bitrate.toString(),
-          '-s', `${targetResolution.width}x${targetResolution.height}`,
+          '-vf', this.scaleCropFilter(targetResolution),
           '-profile:v', 'main',
           '-level', '3.1',
           '-preset', 'fast',
@@ -373,16 +424,21 @@ export class FFmpegService {
     segmentPattern: string,
     resolution: Resolution,
     options: ConversionOptions,
-    onProgress?: (progress: number) => void
+    onProgress?: (progress: number) => void,
+    signal?: AbortSignal
   ): Promise<void> {
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(cancelledError(signal));
+        return;
+      }
       const command = ffmpeg(inputPath)
         .outputOptions([
           '-c:v', 'libx264',
           '-c:a', 'aac',
           '-b:v', resolution.bitrate.toString(),
           '-b:a', options.audioBitrate.toString(),
-          '-s', `${resolution.width}x${resolution.height}`,
+          '-vf', this.scaleCropFilter(resolution),
           '-profile:v', 'main',
           '-level', '3.1',
           '-preset', 'medium',
@@ -413,17 +469,47 @@ export class FFmpegService {
         logger.debug('FFmpeg stderr:', stderrLine);
       });
 
+      // Cancellation (auto-convert timeout or lost claim), CTO re-review P2:
+      // fluent-ffmpeg prepares asynchronously before it spawns ffmpeg, so a
+      // kill() before 'start' finds no process. Kill on abort if running, and
+      // on 'start' if the abort came first. Settle only once ffmpeg has
+      // exited ('end' or 'error'), so the caller never cleans up under a
+      // running process.
+      let started = false;
+      const onAbort = () => {
+        if (started) command.kill('SIGKILL');
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      const settle = (error: Error | null) => {
+        signal?.removeEventListener('abort', onAbort);
+        if (signal?.aborted) {
+          reject(cancelledError(signal));
+        } else if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+
       command
         .output(playlistPath)
+        .on('start', () => {
+          started = true;
+          if (signal?.aborted) command.kill('SIGKILL');
+        })
         .on('end', () => {
           logger.debug(`Variant stream created: ${playlistPath}`);
-          resolve();
+          settle(null);
         })
         .on('error', (error, stdout, stderr) => {
+          if (signal?.aborted) {
+            settle(null);
+            return;
+          }
           logger.error(`Error creating variant stream ${playlistPath}:`, error);
           logger.error('FFmpeg stdout:', stdout);
           logger.error('FFmpeg stderr:', stderr);
-          reject(new Error(`HLS conversion failed: ${error.message}\nStderr: ${stderr}`));
+          settle(new Error(`HLS conversion failed: ${error.message}\nStderr: ${stderr}`));
         })
         .run();
     });
@@ -513,4 +599,10 @@ export class FFmpegService {
       return false;
     }
   }
+}
+
+/** The error a cancelled conversion fails with. */
+export function cancelledError(signal: AbortSignal): Error {
+  const reason = signal.reason;
+  return new Error(`conversion cancelled: ${reason instanceof Error ? reason.message : String(reason ?? 'aborted')}`);
 }

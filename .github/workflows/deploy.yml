@@ -1,40 +1,73 @@
 name: Deploy to AWS
 
+# Manual only. Merging to main deploys nothing (CTO review 2026-11-02, finding 4:
+# a push-triggered deploy targeted us-east-1, ran `cdk deploy` without review and
+# rolled the service onto the mutable `latest` tag).
+#
+# This workflow does an image-only rollout pinned to an immutable digest via
+# scripts/deploy-image-pinned.sh, which copies the CURRENT task definition and
+# changes only the image, and records the previous revision as the rollback
+# target. Infrastructure (CDK) changes are not deployed from here; run
+# `scripts/deploy.sh --infra-only -c imageDigest=...` by hand after `cdk diff`.
+
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
-      deploy_type:
-        description: 'Deployment type'
+      mode:
+        description: 'plan = read-only; register = push image + register task def only; apply = also roll out'
         required: true
-        default: 'full'
+        default: 'plan'
         type: choice
         options:
-          - full
-          - infra-only
-          - image-only
+          - plan
+          - register
+          - apply
+      confirm:
+        description: 'Type the production service name (hls-converter-service) to confirm'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hls-converter-deploy
+  cancel-in-progress: false
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: ca-central-1
+  EXPECTED_ACCOUNT: '442956083883'
   ECR_REPOSITORY: hls-converter
   ECS_SERVICE: hls-converter-service
   ECS_CLUSTER: hls-converter-cluster
 
 jobs:
   deploy:
-    name: Deploy
+    name: Pinned image rollout
     runs-on: ubuntu-latest
-    
+    if: github.ref == 'refs/heads/main'
+    environment: production
     steps:
+      - name: Check confirmation
+        if: inputs.confirm != 'hls-converter-service'
+        run: |
+          echo "Confirmation does not match; nothing was done." >&2
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
+
+      - name: Typecheck and test
+        run: |
+          npm ci
+          npx tsc --noEmit
+          npm test
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -43,74 +76,23 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Install CDK dependencies
-        if: github.event.inputs.deploy_type != 'image-only'
-        run: |
-          cd infra
-          npm ci
+      - name: Set up Docker Buildx
+        if: inputs.mode != 'plan'
+        uses: docker/setup-buildx-action@v3
 
-      - name: Deploy Infrastructure
-        if: github.event.inputs.deploy_type != 'image-only'
+      - name: Roll out
         run: |
-          cd infra
-          npx cdk deploy --require-approval never
+          case "${{ inputs.mode }}" in
+            plan) scripts/deploy-image-pinned.sh --plan ;;
+            register) scripts/deploy-image-pinned.sh ;;
+            apply) scripts/deploy-image-pinned.sh --apply ;;
+          esac
 
-      - name: Login to Amazon ECR
-        if: github.event.inputs.deploy_type != 'infra-only'
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build, tag, and push image to Amazon ECR
-        if: github.event.inputs.deploy_type != 'infra-only'
-        id: build-image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          # Build Docker image
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          
-          # Push both tags
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-
-      - name: Update ECS service
-        if: github.event.inputs.deploy_type != 'infra-only'
-        run: |
-          aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service $ECS_SERVICE \
-            --force-new-deployment
-
-      - name: Wait for service stability
-        if: github.event.inputs.deploy_type != 'infra-only'
-        run: |
-          aws ecs wait services-stable \
-            --cluster $ECS_CLUSTER \
-            --services $ECS_SERVICE
-
-      - name: Get deployment info
-        id: get-info
-        run: |
-          ALB_DNS=$(aws cloudformation describe-stacks \
-            --stack-name HlsConverterStack \
-            --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerDNS'].OutputValue" \
-            --output text)
-          echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
-
-      - name: Deployment Summary
-        run: |
-          echo "## Deployment Complete! 🚀" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**API URL:** http://${{ steps.get-info.outputs.alb_dns }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Cluster:** ${{ env.ECS_CLUSTER }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Service:** ${{ env.ECS_SERVICE }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Test the deployment:" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "curl http://${{ steps.get-info.outputs.alb_dns }}/health" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+      - name: Keep the deploy record
+        if: always() && inputs.mode != 'plan'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-record-${{ github.sha }}
+          path: deploy-records/
+          if-no-files-found: ignore
+          retention-days: 400

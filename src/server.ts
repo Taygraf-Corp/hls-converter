@@ -2,13 +2,17 @@ import express, { Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import cors from 'cors';
 import path from 'path';
-import { FFmpegService } from './services/ffmpeg.js';
+import { FFmpegService, cancelledError } from './services/ffmpeg.js';
 import { SupabaseStorageService } from './services/supabase.js';
 import { VideoFile, ConversionOptions } from './types/index.js';
 import { logger } from './utils/logger.js';
 import { ensureDir, cleanup, generateTempDir, getFilenameWithoutExtension } from './utils/file-utils.js';
 import { migrationConfig, resolutionSets } from './config/index.js';
 import { authenticate, isAuthEnabled } from './middleware/auth.js';
+import { PUBLIC_SOURCE_BUCKET, isUuid } from './services/hls-policy.js';
+import { HlsLifecycle, Outcome } from './services/hls-lifecycle.js';
+import { HlsAutoConvert } from './services/hls-autoconvert.js';
+import { TaskProtection } from './services/task-protection.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -50,7 +54,6 @@ const upload = multer({
 // Services
 const ffmpegService = new FFmpegService();
 const storageService = new SupabaseStorageService();
-const supabase = new SupabaseStorageService();
 
 /**
  * Process video and convert to HLS
@@ -58,12 +61,8 @@ const supabase = new SupabaseStorageService();
 async function processVideo(
   inputPath: string,
   filename: string,
-  options?: {
-    userId?: string;
-    videoId?: string;
-    customPath?: string;
-    postId?: string;
-  }
+  storagePath: string,
+  signal?: AbortSignal
 ): Promise<{
   success: boolean;
   outputFiles?: string[];
@@ -82,6 +81,8 @@ async function processVideo(
     if (!isValid) {
       throw new Error('Invalid video file');
     }
+
+    if (signal?.aborted) throw cancelledError(signal);
 
     // Get metadata and create smart conversion options
     const metadata = await ffmpegService.getVideoMetadata(inputPath);
@@ -112,6 +113,7 @@ async function processVideo(
     const outputDir = path.join(tempDir, 'hls');
 
     // Convert to HLS
+    if (signal?.aborted) throw cancelledError(signal);
     logger.info(`Converting to HLS...`);
     const outputFiles = await ffmpegService.convertToHls(
       inputPath,
@@ -119,43 +121,18 @@ async function processVideo(
       smartOptions,
       (progress) => {
         logger.debug(`Conversion progress: ${progress.toFixed(1)}%`);
-      }
-    );
-
-    // Determine storage path
-    const storagePath = options?.customPath || buildStoragePath(
-      baseFilename,
-      options?.videoId
+      },
+      signal
     );
 
     // Upload to Supabase Storage
+    if (signal?.aborted) throw cancelledError(signal);
     logger.info(`Uploading to storage: ${storagePath}`);
     const uploadedFiles = await storageService.uploadHlsFiles(
       outputDir,
-      storagePath
+      storagePath,
+      signal
     );
-
-    // Update post with HLS URL if postId provided
-    const postId = options?.postId;
-    if (postId) {
-      try {
-        // Construct full public HLS URL
-        const baseStorageUrl = process.env.PUBLIC_STORAGE_BASE_URL || 
-          'https://ohfzckfunpsjncjjzfyz.supabase.co/storage/v1/object/public/FlutterFlow/';
-        const masterPlaylistPath = uploadedFiles.find(f => f.endsWith('master.m3u8'));
-        
-        if (masterPlaylistPath) {
-          const hlsUrl = `${baseStorageUrl}${masterPlaylistPath}`;
-          logger.info(`Updating post ${postId} with HLS URL: ${hlsUrl}`);
-          
-          await supabase.updatePost(postId, {
-            hls_url: hlsUrl
-          });
-        }
-      } catch (error) {
-        logger.error(`Error updating post ${postId}:`, error);
-      }
-    }
 
     const processingTime = Date.now() - startTime;
 
@@ -201,40 +178,168 @@ async function processVideo(
   }
 }
 
+const PUBLIC_STORAGE_BASE_URL = process.env.PUBLIC_STORAGE_BASE_URL ||
+  'https://ohfzckfunpsjncjjzfyz.supabase.co/storage/v1/object/public/FlutterFlow/';
+
 /**
- * Build storage path
- * Structure: converted/{filename}/hls
+ * Routes the app does not use (manual upload, validate, metadata, the test
+ * page) stay off unless ENABLE_ADMIN_ROUTES=true: /api/upload used to write
+ * hls_url onto any caller-named post (CTO review 2026-11-02, finding 1).
  */
-function buildStoragePath(
-  filename: string,
-  videoId?: string
-): string {
-  const parts = [migrationConfig.storage.targetFolder];
+const adminRoutesEnabled = process.env.ENABLE_ADMIN_ROUTES === 'true';
+function adminOnly(_req: Request, res: Response, next: NextFunction): void {
+  if (!adminRoutesEnabled) {
+    res.status(404).json({ success: false, error: 'Route not found' });
+    return;
+  }
+  next();
+}
 
-  // Use videoId if provided, otherwise sanitize filename
-  const id = videoId || sanitizeFilename(filename);
-  parts.push(id, 'hls');
+const lifecycle = new HlsLifecycle(storageService, {
+  root: migrationConfig.storage.targetFolder,
+  bucket: migrationConfig.storage.targetBucket,
+  publicBase: PUBLIC_STORAGE_BASE_URL,
+  staleMs: Number(process.env.HLS_STALE_MS || 3_600_000),
+  intervalMs: Number(process.env.HLS_RECONCILE_INTERVAL_MS ?? 60_000),
+  scanMs: Number(process.env.HLS_RECONCILE_SCAN_MS || 3_600_000),
+  batch: Number(process.env.HLS_RECONCILE_BATCH || 20),
+  requireQueue: process.env.REQUIRE_REVOCATION_QUEUE !== 'false',
+  healthMs: Number(process.env.HLS_QUEUE_HEALTH_MS || 300_000),
+});
 
-  return parts.join('/');
+/**
+ * Settle with [p], or fail as soon as [signal] aborts. The abandoned promise
+ * keeps running; its failure is swallowed here.
+ */
+function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return p;
+  p.catch(() => {});
+  return new Promise<T>((resolve, reject) => {
+    if (signal.aborted) return reject(cancelledError(signal));
+    const onAbort = () => reject(cancelledError(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then(
+      v => { signal.removeEventListener('abort', onAbort); resolve(v); },
+      e => { signal.removeEventListener('abort', onAbort); reject(e); },
+    );
+  });
 }
 
 /**
- * Sanitize filename
+ * ECS scale-in protection while any conversion runs in this task. Off unless
+ * HLS_TASK_PROTECTION=on (the task role then needs ecs:UpdateTaskProtection).
  */
-function sanitizeFilename(filename: string): string {
-  return filename
-    .replace(/\.[^/.]+$/, '')
-    .replace(/[^a-zA-Z0-9-_]/g, '-')
-    .replace(/-+/g, '-')
-    .toLowerCase();
+const taskProtection = new TaskProtection({
+  agentUri: process.env.ECS_AGENT_URI,
+  enabled: process.env.HLS_TASK_PROTECTION === 'on',
+  expiresInMinutes: Number(process.env.HLS_TASK_PROTECTION_EXPIRES_MIN || 45),
+  renewMs: Number(process.env.HLS_TASK_PROTECTION_RENEW_MS || 600_000),
+  maxHoldMs: Number(process.env.HLS_TASK_PROTECTION_MAX_HOLD_MS || 3_600_000),
+});
+
+/**
+ * Convert [postId]'s own video from bucket/videoPath, under the lifecycle's
+ * policy. Shared by /api/process-from-storage and the auto-convert scan.
+ * [signal] cancels the work (ffmpeg is killed and awaited, nothing more is
+ * uploaded, and the attempt folder is removed); the route passes none.
+ * After a cancellation, [onLateWork] receives a second removal of the attempt
+ * folder for the caller to run later: an upload whose request was aborted may
+ * still have been stored (CTO re-review P1).
+ */
+function convertFromStorage(
+  postId: string,
+  sourceBucket: string,
+  videoPath: string,
+  signal?: AbortSignal,
+  onLateWork?: (work: () => Promise<unknown>) => void,
+): Promise<Outcome> {
+  return taskProtection.hold(() => convertUnprotected(postId, sourceBucket, videoPath, signal, onLateWork));
 }
+
+async function convertUnprotected(
+  postId: string,
+  sourceBucket: string,
+  videoPath: string,
+  signal?: AbortSignal,
+  onLateWork?: (work: () => Promise<unknown>) => void,
+): Promise<Outcome> {
+  let tempDir: string | null = null;
+  let download: Promise<unknown> | null = null;
+  let attempt: string | null = null;
+  let outcome: Outcome | null = null;
+  try {
+    return outcome = await lifecycle.convert(postId, sourceBucket, videoPath, async (attemptDir) => {
+      attempt = attemptDir;
+      if (signal?.aborted) throw cancelledError(signal);
+      // The local copy gets a fixed name: ffmpeg's output paths are built from
+      // it, and a stored name with a space (n8n uploads) broke the segment path.
+      const ext = path.extname(videoPath);
+      const localName = `source${/^\.[A-Za-z0-9]{1,5}$/.test(ext) ? ext.toLowerCase() : '.mp4'}`;
+      const videoFile: VideoFile = { name: localName, path: videoPath, size: 0, bucket: sourceBucket };
+      tempDir = generateTempDir(migrationConfig.processing.tempDir, 'storage-process');
+      await ensureDir(tempDir);
+      const tempPath = path.join(tempDir, videoFile.name);
+      download = storageService.downloadFile(videoFile, tempPath);
+      await abortable(download, signal);
+      download = null;
+      const result = await processVideo(tempPath, videoFile.name, attemptDir, signal);
+      if (!result.success) {
+        throw new Error(result.error || 'conversion failed');
+      }
+      if (signal?.aborted) throw cancelledError(signal);
+      const files = result.outputFiles ?? [];
+      const master = files.find(f => f.endsWith('master.m3u8'));
+      if (!master) {
+        throw new Error('no master playlist was produced');
+      }
+      return { master, files, metadata: result.metadata, processingTime: result.processingTime };
+    });
+  } finally {
+    // An attempt that did not publish may still receive an upload whose
+    // request was cut off (cancelled, or over its time limit) but which
+    // storage stored anyway. Remove its folder once more later, unless the
+    // row now plays from it (a publish whose outcome was unknown).
+    const failedAttempt: string | null = attempt;
+    const done = outcome as Outcome | null;
+    if (failedAttempt && onLateWork && (done === null || done.status !== 200)) {
+      onLateWork(async () => {
+        const current = await storageService.getHlsUrl(postId);
+        if (current && current.includes(`/${failedAttempt}/`)) return;
+        await storageService.removeTree(failedAttempt);
+      });
+    }
+    const dir: string | null = tempDir;
+    if (dir) {
+      if (download) {
+        // A cancelled download may still write into dir; remove it after.
+        void (download as Promise<unknown>).catch(() => {}).finally(() => cleanup([dir]).catch(() => {}));
+      } else {
+        await cleanup([dir]).catch(() => {});
+      }
+    }
+  }
+}
+
+/**
+ * Automatic conversion of new videos nobody asked HLS for (n8n, failed app
+ * requests). Off unless HLS_AUTOCONVERT_INTERVAL_MS is set (e.g. 600000), so a
+ * deploy alone never starts it.
+ */
+const autoConvert = new HlsAutoConvert(storageService, convertFromStorage, () => lifecycle.queueHealthy(), {
+  intervalMs: Number(process.env.HLS_AUTOCONVERT_INTERVAL_MS || 0),
+  batch: Number(process.env.HLS_AUTOCONVERT_BATCH || 1),
+  leaseMs: Number(process.env.HLS_AUTOCONVERT_LEASE_MS || 900_000),
+  timeoutMs: Number(process.env.HLS_AUTOCONVERT_TIMEOUT_MS || 1_800_000),
+  requestTimeoutMs: Number(process.env.HLS_AUTOCONVERT_REQUEST_TIMEOUT_MS || 120_000),
+  lateSweepMs: process.env.HLS_AUTOCONVERT_LATE_SWEEP_MS ? Number(process.env.HLS_AUTOCONVERT_LATE_SWEEP_MS) : undefined,
+});
 
 // Routes
 
 /**
  * Home page - Upload test interface
  */
-app.get('/', (req: Request, res: Response) => {
+app.get('/', adminOnly, (req: Request, res: Response) => {
   res.sendFile(path.join(process.cwd(), 'examples', 'upload-test.html'));
 });
 
@@ -242,8 +347,16 @@ app.get('/', (req: Request, res: Response) => {
  * Health check
  */
 app.get('/health', (req: Request, res: Response) => {
-  res.json({ 
+  res.json({
     status: 'ok',
+    // 'ok' while the HLS revocation queue is drained; private media is only
+    // converted then. The ALB health check only needs the 200.
+    revocationQueue: lifecycle.queueHealthy() ? 'ok' : 'unavailable',
+    // 'off' | 'idle' | 'working', and auto-convert work still settling after a
+    // cancellation. Before rolling back: 'off' or 'idle', and 0.
+    autoConvert: autoConvert.status(),
+    // 'off' | 'idle' | 'protected' | 'unprotected' (work running, agent request failed).
+    taskProtection: taskProtection.status(),
     timestamp: new Date().toISOString()
   });
 });
@@ -251,7 +364,7 @@ app.get('/health', (req: Request, res: Response) => {
 /**
  * Upload and process video
  */
-app.post('/api/upload', authenticate, upload.single('video'), async (req: Request, res: Response) => {
+app.post('/api/upload', adminOnly, authenticate, upload.single('video'), async (req: Request, res: Response) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -262,13 +375,11 @@ app.post('/api/upload', authenticate, upload.single('video'), async (req: Reques
 
     logger.info(`Received upload: ${req.file.originalname} (${(req.file.size / 1024 / 1024).toFixed(2)} MB)`);
 
-    const { userId, videoId, postId } = req.body;
-
-    // Process the video
+    // Admin-only test path: never bound to a post, never a caller-chosen folder.
     const result = await processVideo(
       req.file.path,
       req.file.originalname,
-      { userId, videoId, postId }
+      `${migrationConfig.storage.targetFolder}/manual-${Date.now()}-${Math.round(Math.random() * 1e9)}/hls`
     );
 
     // Cleanup uploaded file
@@ -310,7 +421,7 @@ app.post('/api/upload', authenticate, upload.single('video'), async (req: Reques
 /**
  * Validate video without processing
  */
-app.post('/api/validate', authenticate, upload.single('video'), async (req: Request, res: Response) => {
+app.post('/api/validate', adminOnly, authenticate, upload.single('video'), async (req: Request, res: Response) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -366,7 +477,7 @@ app.post('/api/validate', authenticate, upload.single('video'), async (req: Requ
 /**
  * Get video metadata from URL
  */
-app.post('/api/metadata', authenticate, express.json(), async (req: Request, res: Response) => {
+app.post('/api/metadata', adminOnly, authenticate, express.json(), async (req: Request, res: Response) => {
   try {
     const { videoPath, bucket } = req.body;
 
@@ -417,64 +528,71 @@ app.post('/api/metadata', authenticate, express.json(), async (req: Request, res
 });
 
 /**
- * Process video from storage
+ * Convert one post's own video to HLS and set its hls_url.
+ *
+ * Body: { postId, videoPath, bucket?, videoId? }. postId is required and the
+ * output folder is derived from it (converted/<postId>/hls/<attempt>/). The
+ * post row decides; see services/hls-lifecycle.ts for the full contract.
+ * 200 published (or already had HLS); 403 refused; 409 the post changed or
+ * another post owns the folder; 503 private media while the revocation queue
+ * is down; 500 failure (this attempt's files removed, or left for the
+ * reconciler when the database outcome is unknown).
  */
 app.post('/api/process-from-storage', authenticate, express.json(), async (req: Request, res: Response) => {
+  const { videoPath, bucket, videoId, postId } = req.body ?? {};
+  if (typeof videoPath !== 'string' || !videoPath || videoPath.includes('..')) {
+    return res.status(400).json({ success: false, error: 'videoPath is required' });
+  }
+  if (!isUuid(postId)) {
+    return res.status(400).json({ success: false, error: 'postId (a UUID) is required' });
+  }
+  if (videoId !== undefined && videoId !== null && String(videoId).toLowerCase() !== postId.toLowerCase()) {
+    return res.status(400).json({ success: false, error: 'videoId, when given, must equal postId' });
+  }
+  const sourceBucket: string = typeof bucket === 'string' && bucket ? bucket : PUBLIC_SOURCE_BUCKET;
+
   try {
-    const { videoPath, bucket, userId, videoId, postId } = req.body;
-
-    if (!videoPath) {
-      return res.status(400).json({
-        success: false,
-        error: 'videoPath is required'
-      });
+    const outcome = await convertFromStorage(postId.toLowerCase(), sourceBucket, videoPath);
+    if (outcome.status !== 200) {
+      logger.warn(`process-from-storage: ${outcome.status} ${String(outcome.body.error ?? '')}`);
     }
-
-    const videoFile: VideoFile = {
-      name: path.basename(videoPath),
-      path: videoPath,
-      size: 0,
-      bucket: bucket || migrationConfig.storage.sourceBucket
-    };
-
-    logger.info(`Processing from storage: ${videoPath}`);
-
-    // Download video
-    const tempDir = generateTempDir(migrationConfig.processing.tempDir, 'storage-process');
-    await ensureDir(tempDir);
-    const tempPath = path.join(tempDir, videoFile.name);
-
-    await storageService.downloadFile(videoFile, tempPath);
-
-    // Process the video
-    const result = await processVideo(tempPath, videoFile.name, { userId, videoId, postId });
-
-    // Cleanup
-    await cleanup([tempDir]);
-
-    if (!result.success) {
-      return res.status(500).json({
-        success: false,
-        error: result.error
-      });
-    }
-
-    res.json({
-      success: true,
-      message: 'Video processed successfully',
-      data: {
-        outputFiles: result.outputFiles,
-        metadata: result.metadata,
-        processingTime: result.processingTime,
-        masterPlaylist: result.outputFiles?.find(f => f.endsWith('master.m3u8'))
-      }
-    });
-
+    return res.status(outcome.status).json(outcome.body);
   } catch (error) {
     logger.error('Process from storage error:', error);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Processing failed'
+    });
+  }
+});
+
+/**
+ * Remove a post's public HLS when it must no longer exist (deleted, hidden,
+ * VIP, expired, unpublished, media changed, author being deleted). A post that
+ * is still eligible keeps its HLS (409), so the app's key cannot strip anyone's
+ * video. The database queue retries this on its own; the app's call after a
+ * delete is only the fast path. Body: { postId }.
+ */
+app.post('/api/revoke-hls', authenticate, express.json(), async (req: Request, res: Response) => {
+  const { postId } = req.body ?? {};
+  if (!isUuid(postId)) {
+    return res.status(400).json({ success: false, error: 'postId (a UUID) is required' });
+  }
+  try {
+    const r = await lifecycle.revoke(postId.toLowerCase());
+    if (!r.revoked) {
+      return res.status(409).json({ success: false, error: 'post is still eligible; HLS kept' });
+    }
+    if (r.kept) {
+      return res.status(409).json({ success: false, error: `${r.kept}; kept`, removed: r.removed });
+    }
+    logger.info(`Revoked HLS: ${r.removed} object(s) removed`);
+    return res.json({ success: true, removed: r.removed });
+  } catch (error) {
+    logger.error('Revoke HLS error:', error);
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Revoke failed'
     });
   }
 });
@@ -530,6 +648,12 @@ app.use((req: Request, res: Response) => {
 
 // Start server
 app.listen(PORT, () => {
+  lifecycle.start();
+  autoConvert.start();
+  if (taskProtection.configured) {
+    const t = taskProtection.settings();
+    logger.info(`🛡️  Task scale-in protection: ON while converting (expiry ${t.expiresInMinutes} min, renew ${t.renewMs} ms, max hold ${t.maxHoldMs} ms)`);
+  }
   logger.info(`🚀 Video processing server running on port ${PORT}`);
   logger.info(`📁 Storage: ${migrationConfig.storage.targetBucket}/${migrationConfig.storage.targetFolder}`);
   logger.info(`🎬 FFmpeg ready for video processing`);

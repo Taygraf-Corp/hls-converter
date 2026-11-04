@@ -9,6 +9,8 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 
 export interface HlsConverterConfig {
+  /** Immutable image digest (sha256:...) the task definition runs. */
+  imageDigest: string;
   supabaseUrl?: string;
   supabaseAnonKey?: string;
   apiKey?: string;
@@ -85,6 +87,7 @@ export class HlsConverterStack extends cdk.Stack {
         secretStringTemplate: JSON.stringify({
           SUPABASE_URL: config.supabaseUrl || 'REPLACE_ME',
           SUPABASE_ANON_KEY: config.supabaseAnonKey || 'REPLACE_ME',
+          SUPABASE_SERVICE_ROLE_KEY: 'REPLACE_ME',
           API_KEY: config.apiKey || 'REPLACE_ME',
         }),
         generateStringKey: 'dummy', // Required but we don't use it
@@ -135,7 +138,9 @@ export class HlsConverterStack extends cdk.Stack {
 
     // Add container
     const container = taskDefinition.addContainer('app', {
-      image: ecs.ContainerImage.fromEcrRepository(this.repository, 'latest'),
+      // Pinned to an immutable digest: a stack deploy must never roll the
+      // service onto whatever `latest` happens to be.
+      image: ecs.ContainerImage.fromEcrRepository(this.repository, config.imageDigest),
       containerName: 'hls-converter',
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'hls-converter',
@@ -153,6 +158,9 @@ export class HlsConverterStack extends cdk.Stack {
       secrets: {
         SUPABASE_URL: ecs.Secret.fromSecretsManager(appSecrets, 'SUPABASE_URL'),
         SUPABASE_ANON_KEY: ecs.Secret.fromSecretsManager(appSecrets, 'SUPABASE_ANON_KEY'),
+        // The service reads posts and writes hls_url with the service role and
+        // refuses to start without it (src/services/supabase.ts).
+        SUPABASE_SERVICE_ROLE_KEY: ecs.Secret.fromSecretsManager(appSecrets, 'SUPABASE_SERVICE_ROLE_KEY'),
         API_KEY: ecs.Secret.fromSecretsManager(appSecrets, 'API_KEY'),
       },
       healthCheck: {
@@ -163,6 +171,13 @@ export class HlsConverterStack extends cdk.Stack {
         startPeriod: cdk.Duration.seconds(60),
       },
     });
+
+    // Scale-in protection while a conversion runs (src/services/task-protection.ts,
+    // used only when HLS_TASK_PROTECTION=on). Limited to this cluster's tasks.
+    taskDefinition.addToTaskRolePolicy(new iam.PolicyStatement({
+      actions: ['ecs:UpdateTaskProtection', 'ecs:GetTaskProtection'],
+      resources: [`arn:aws:ecs:${this.region}:${this.account}:task/${this.cluster.clusterName}/*`],
+    }));
 
     container.addPortMappings({
       containerPort: 3000,

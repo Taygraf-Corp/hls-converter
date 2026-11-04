@@ -13,11 +13,20 @@ const app = new cdk.App();
 // Get environment from context or use defaults
 const env = {
   account: process.env.CDK_DEFAULT_ACCOUNT || process.env.AWS_ACCOUNT_ID,
-  region: process.env.CDK_DEFAULT_REGION || process.env.AWS_REGION || 'us-east-1',
+  region: process.env.CDK_DEFAULT_REGION || process.env.AWS_REGION || 'ca-central-1', // production runs in ca-central-1
 };
 
 // Configuration from environment variables or context
+const imageDigest: string | undefined = app.node.tryGetContext('imageDigest') || process.env.IMAGE_DIGEST;
+if (!imageDigest || !/^sha256:[0-9a-f]{64}$/.test(imageDigest)) {
+  throw new Error(
+    'Set the image to deploy as an immutable digest: -c imageDigest=sha256:<64 hex> ' +
+    '(see scripts/deploy-image-pinned.sh). The stack never deploys a mutable tag.'
+  );
+}
+
 const config = {
+  imageDigest,
   // Supabase configuration
   supabaseUrl: app.node.tryGetContext('supabaseUrl') || process.env.SUPABASE_URL,
   supabaseAnonKey: app.node.tryGetContext('supabaseAnonKey') || process.env.SUPABASE_ANON_KEY,
