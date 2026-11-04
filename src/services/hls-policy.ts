@@ -10,6 +10,8 @@
  * the General Feed, Unfiltered or both; the copy is public by link while the
  * post is published. CTO review 2026-11-02 (finding 3): a hidden, VIP,
  * expiring, expired or deleted private video must not get or keep one.
+ * CTO 2026-11-04: nor may a legacy (public video_url) post whose access type
+ * is PRIVATE; every post needs type UNFILTERED or PUBLIC.
  */
 
 export const PUBLIC_SOURCE_BUCKET = 'FlutterFlow';
@@ -103,6 +105,10 @@ export function conversionRefusal(
     }
     if (!urlNamesObject(post.video_url, bucket, objectPath)) {
       return 'videoPath is not this post\'s video';
+    }
+    // CTO 2026-11-04: legacy PRIVATE posts get no public HLS copy.
+    if (post.type !== 'UNFILTERED' && post.type !== 'PUBLIC') {
+      return 'post access type is not convertible';
     }
     if (expired(post.expires_at, now)) {
       return 'post has expired';
@@ -212,6 +218,7 @@ export function publishConditions(post: PostRow, now: Date = new Date()): Condit
     ...common,
     { col: 'media_path', op: 'is', value: null },
     { col: 'video_url', op: 'eq', value: post.video_url as string },
+    { col: 'type', op: 'in', value: ['UNFILTERED', 'PUBLIC'] },
     { or: [{ col: 'expires_at', op: 'is', value: null }, { col: 'expires_at', op: 'gt', value: now.toISOString() }] },
   ];
 }

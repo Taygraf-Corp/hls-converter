@@ -72,6 +72,9 @@ test('a legacy public video may be converted only from its own video_url', () =>
   assert.match(ok(legacy({ expires_at: '2026-01-01T00:00:00Z' }), 'FlutterFlow', 'Videos/1.mp4')!, /expired/);
   assert.match(ok(legacy({ is_hidden: true }), 'FlutterFlow', 'Videos/1.mp4')!, /hidden/);
   assert.match(ok(priv({ video_url: PUBLIC }), 'FlutterFlow', 'Videos/1.mp4')!, /private media/);
+  // CTO 2026-11-04: legacy PRIVATE posts get no public HLS.
+  assert.match(ok(legacy({ type: 'PRIVATE' }), 'FlutterFlow', 'Videos/1.mp4')!, /access type/);
+  assert.equal(ok(legacy({ type: 'UNFILTERED' }), 'FlutterFlow', 'Videos/1.mp4'), null);
   const encoded = legacy({ video_url: PUBLIC.replace('1.mp4', 'a%20b.mp4') });
   assert.equal(ok(encoded, 'FlutterFlow', 'Videos/a b.mp4'), null);
 });
@@ -93,6 +96,7 @@ test('revoke is required exactly when the post may no longer have HLS', () => {
   assert.equal(revokeRequired(priv({ in_general_feed: false }), false, NOW), true);
   assert.equal(revokeRequired(legacy({ expires_at: '2026-01-01T00:00:00Z' }), false, NOW), true);
   assert.equal(revokeRequired(legacy({ video_url: null }), false, NOW), true);
+  assert.equal(revokeRequired(legacy({ type: 'PRIVATE' }), false, NOW), true, 'a legacy PRIVATE post loses its HLS');
 });
 
 test('R3: the publishing UPDATE re-applies exactly the conversion policy', async () => {
